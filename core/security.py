@@ -82,7 +82,7 @@ async def get_meta_config(user_uid: str) -> dict:
         dict com app_id e app_secret
     """
     client = get_secret_manager_client()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "proof-social")
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "proof-social-ai")
     
     try:
         # Busca App ID
