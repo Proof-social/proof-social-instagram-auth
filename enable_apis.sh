@@ -3,7 +3,7 @@
 # Script para habilitar todas as APIs necessárias no projeto proof-social
 # Execute este script com uma conta que tenha permissões de Owner/Editor
 
-PROJECT_ID="proof-social"
+PROJECT_ID="proof-social-ai"
 
 echo "🔧 Habilitando APIs necessárias no projeto $PROJECT_ID..."
 echo ""

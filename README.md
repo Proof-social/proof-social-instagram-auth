@@ -191,7 +191,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 # Build e deploy
 gcloud builds submit --tag gcr.io/proof-social/proof-social-instagram-auth
 gcloud run deploy proof-social-instagram-auth \
-  --image gcr.io/proof-social/proof-social-instagram-auth \
+  --image gcr.io/proof-social-ai/proof-social-instagram-auth \
   --platform managed \
   --region us-central1
 ```

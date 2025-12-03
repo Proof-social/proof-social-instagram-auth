@@ -1,8 +1,8 @@
-# Habilitar APIs do Google Cloud - Projeto proof-social
+# Habilitar APIs do Google Cloud - Projeto proof-social-ai
 
 ## 📋 APIs Necessárias
 
-O projeto `proof-social-instagram-auth` requer as seguintes APIs do Google Cloud:
+O projeto `proof-social-ai-instagram-auth` requer as seguintes APIs do Google Cloud:
 
 1. **Secret Manager API** (`secretmanager.googleapis.com`)
    - Para armazenar App ID e App Secret do Meta
@@ -33,7 +33,7 @@ O projeto `proof-social-instagram-auth` requer as seguintes APIs do Google Cloud
 Execute o script com uma conta que tenha permissões de Owner/Editor:
 
 ```bash
-cd /Users/luizsegundo/proof-social-instagram-auth
+cd /Users/luizsegundo/proof-social-ai-instagram-auth
 chmod +x enable_apis.sh
 ./enable_apis.sh
 ```
@@ -43,7 +43,7 @@ chmod +x enable_apis.sh
 Execute os seguintes comandos:
 
 ```bash
-gcloud config set project proof-social
+gcloud config set project proof-social-ai
 
 # Habilitar todas as APIs de uma vez
 gcloud services enable \
@@ -53,45 +53,45 @@ gcloud services enable \
     cloudbuild.googleapis.com \
     containerregistry.googleapis.com \
     artifactregistry.googleapis.com \
-    --project=proof-social
+    --project=proof-social-ai
 ```
 
 ## 🔧 Opção 3: Via Console do Google Cloud
 
 ### Habilitar todas as APIs de uma vez:
 
-1. Acesse: https://console.cloud.google.com/apis/library?project=proof-social
+1. Acesse: https://console.cloud.google.com/apis/library?project=proof-social-ai
 2. Para cada API, clique no nome e depois em "ENABLE":
 
    - **Secret Manager API**
-     - Link: https://console.cloud.google.com/apis/library/secretmanager.googleapis.com?project=proof-social
+     - Link: https://console.cloud.google.com/apis/library/secretmanager.googleapis.com?project=proof-social-ai
    
    - **Cloud Firestore API**
-     - Link: https://console.cloud.google.com/apis/library/firestore.googleapis.com?project=proof-social
+     - Link: https://console.cloud.google.com/apis/library/firestore.googleapis.com?project=proof-social-ai
    
    - **Cloud Run API**
-     - Link: https://console.cloud.google.com/apis/library/run.googleapis.com?project=proof-social
+     - Link: https://console.cloud.google.com/apis/library/run.googleapis.com?project=proof-social-ai
    
    - **Cloud Build API**
-     - Link: https://console.cloud.google.com/apis/library/cloudbuild.googleapis.com?project=proof-social
+     - Link: https://console.cloud.google.com/apis/library/cloudbuild.googleapis.com?project=proof-social-ai
    
    - **Container Registry API**
-     - Link: https://console.cloud.google.com/apis/library/containerregistry.googleapis.com?project=proof-social
+     - Link: https://console.cloud.google.com/apis/library/containerregistry.googleapis.com?project=proof-social-ai
    
    - **Artifact Registry API**
-     - Link: https://console.cloud.google.com/apis/library/artifactregistry.googleapis.com?project=proof-social
+     - Link: https://console.cloud.google.com/apis/library/artifactregistry.googleapis.com?project=proof-social-ai
 
 ### Ou habilitar todas de uma vez:
 
 Acesse este link para ver todas as APIs e habilitar as necessárias:
-https://console.cloud.google.com/apis/library?project=proof-social&q=secretmanager%20OR%20firestore%20OR%20run%20OR%20cloudbuild%20OR%20containerregistry%20OR%20artifactregistry
+https://console.cloud.google.com/apis/library?project=proof-social-ai&q=secretmanager%20OR%20firestore%20OR%20run%20OR%20cloudbuild%20OR%20containerregistry%20OR%20artifactregistry
 
 ## ✅ Verificar APIs Habilitadas
 
 Após habilitar, verifique com:
 
 ```bash
-gcloud services list --enabled --project=proof-social \
+gcloud services list --enabled --project=proof-social-ai \
     --filter="name:secretmanager OR name:firestore OR name:run OR name:cloudbuild OR name:containerregistry OR name:artifactregistry"
 ```
 
@@ -106,5 +106,5 @@ Para habilitar APIs, você precisa de uma das seguintes roles:
 
 - As APIs podem levar alguns minutos para serem totalmente habilitadas
 - Algumas APIs podem ter custos associados (verifique a documentação)
-- Certifique-se de que o projeto `proof-social` existe e você tem acesso
+- Certifique-se de que o projeto `proof-social-ai` existe e você tem acesso
 

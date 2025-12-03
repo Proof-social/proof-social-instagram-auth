@@ -22,7 +22,7 @@ steps:
       - 'us-central1'
       - '--allow-unauthenticated'
       - '--set-env-vars'
-      - 'GOOGLE_CLOUD_PROJECT=$PROJECT_ID'
+      - 'GOOGLE_CLOUD_PROJECT=proof-social-ai'
 
 images:
   - 'gcr.io/$PROJECT_ID/proof-social-instagram-auth'

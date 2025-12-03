@@ -3,7 +3,7 @@
 # Script para criar secrets no Google Cloud Secret Manager
 # Execute este script após habilitar a Secret Manager API no projeto proof-social
 
-PROJECT_ID="proof-social"
+PROJECT_ID="proof-social-ai"
 APP_ID="4109658012632973"
 APP_SECRET="40a3ed6ead74584405a2fc7163b17652"
 

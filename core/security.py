@@ -113,7 +113,7 @@ async def save_access_token(user_uid: str, access_token: str):
         access_token: Token de acesso do Meta
     """
     client = get_secret_manager_client()
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "proof-social")
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "proof-social-ai")
     secret_id = f"proof-social-instagram-{user_uid}"
     
     try:
