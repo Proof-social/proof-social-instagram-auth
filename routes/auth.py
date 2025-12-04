@@ -5,7 +5,7 @@ Endpoints de autenticação OAuth Instagram/Meta
 import logging
 import uuid
 import httpx
-from fastapi import APIRouter, HTTPException, Header, Depends, Response, Response
+from fastapi import APIRouter, HTTPException, Header, Depends, Response
 from typing import Optional
 from urllib.parse import urlencode
 import json
@@ -24,8 +24,6 @@ from core.security import (
 )
 from google.cloud import firestore
 import os
-from urllib.parse import urlencode
-import json
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
