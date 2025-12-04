@@ -41,6 +41,6 @@ class InstagramCallbackResponse(BaseModel):
     """Response após processar callback"""
     api_key: str
     instagram_accounts: List[InstagramAccount]
-    pages: List[InstagramPage]
     message: str
+    status: str
 

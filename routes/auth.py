@@ -41,7 +41,8 @@ INSTAGRAM_SCOPES = [
     "pages_read_engagement",
     "pages_manage_ads",
     "instagram_branded_content_ads_brand",
-    "instagram_manage_events"
+    "instagram_manage_events",
+    "business_management"  # Necessário para acessar contas Instagram selecionadas
 ]
 
 
@@ -175,56 +176,104 @@ async def instagram_process_callback(
             # 3. Salvar token no Secret Manager
             await save_access_token(user_uid, long_lived_token)
             
-            # 4. Buscar páginas do usuário
-            logger.info(f"Buscando páginas do usuário com token de longa duração...")
+            # 4. Buscar contas Instagram do usuário
+            logger.info(f"Buscando contas Instagram do usuário com token de longa duração...")
+            instagram_accounts = []
+            pages = []
+            
+            # Método 1: Buscar através de páginas (método tradicional)
+            logger.info("Tentando buscar contas Instagram através de páginas...")
             pages_response = await client.get(
                 "https://graph.facebook.com/v20.0/me/accounts",
                 params={
                     "access_token": long_lived_token,
-                    "fields": "id,name,instagram_business_account{id,username}"
+                    "fields": "id,name,access_token,instagram_business_account{id,username,name}"
                 }
             )
             
             logger.info(f"Resposta da API Meta para /me/accounts: status={pages_response.status_code}")
             
-            pages = []
-            instagram_accounts = []
-            
             if pages_response.status_code == 200:
                 pages_data = pages_response.json()
-                logger.info(f"Dados brutos da API Meta: {pages_data}")
+                logger.info(f"Dados brutos da API Meta (/me/accounts): {pages_data}")
                 logger.info(f"Total de páginas retornadas: {len(pages_data.get('data', []))}")
                 
                 for page_data in pages_data.get("data", []):
                     logger.info(f"Processando página: {page_data}")
-                    page = InstagramPage(
-                        id=page_data["id"],
-                        name=page_data.get("name", "")
-                    )
                     
                     # Verifica se tem conta Instagram conectada
                     if "instagram_business_account" in page_data:
                         ig_account_data = page_data["instagram_business_account"]
-                        logger.info(f"Conta Instagram encontrada: {ig_account_data}")
+                        logger.info(f"Conta Instagram encontrada na página: {ig_account_data}")
+                        
+                        # Buscar username completo se não estiver disponível
+                        ig_account_id = ig_account_data.get("id")
+                        ig_username = ig_account_data.get("username")
+                        
+                        # Se não tiver username, buscar diretamente da conta Instagram
+                        if not ig_username and ig_account_id:
+                            logger.info(f"Buscando username da conta Instagram {ig_account_id}...")
+                            ig_account_response = await client.get(
+                                f"https://graph.facebook.com/v20.0/{ig_account_id}",
+                                params={
+                                    "access_token": long_lived_token,
+                                    "fields": "id,username,name"
+                                }
+                            )
+                            if ig_account_response.status_code == 200:
+                                ig_account_info = ig_account_response.json()
+                                ig_username = ig_account_info.get("username")
+                                logger.info(f"Username obtido: {ig_username}")
+                        
                         ig_account = InstagramAccount(
-                            id=ig_account_data["id"],
-                            username=ig_account_data.get("username"),
-                            name=page_data.get("name")
+                            id=ig_account_id,
+                            username=ig_username,
+                            name=ig_account_data.get("name") or ig_account_data.get("username")
                         )
-                        page.instagram_business_account = ig_account
-                        instagram_accounts.append(ig_account)
-                        logger.info(f"Conta Instagram adicionada: id={ig_account.id}, username={ig_account.username}")
+                        
+                        # Evitar duplicatas
+                        if not any(acc.id == ig_account.id for acc in instagram_accounts):
+                            instagram_accounts.append(ig_account)
+                            logger.info(f"Conta Instagram adicionada: id={ig_account.id}, username={ig_account.username}")
+                        else:
+                            logger.info(f"Conta Instagram já existe, ignorando duplicata: {ig_account.id}")
                     else:
                         logger.info(f"Página {page_data.get('name')} não tem conta Instagram conectada")
-                    
-                    pages.append(page)
-                    logger.info(f"Página adicionada: id={page.id}, name={page.name}")
             else:
                 error_data = pages_response.json() if pages_response.content else {}
-                logger.error(f"Erro ao buscar páginas: status={pages_response.status_code}, error={error_data}")
+                logger.warning(f"Erro ao buscar páginas: status={pages_response.status_code}, error={error_data}")
             
-            logger.info(f"Total de páginas processadas: {len(pages)}")
+            # Método 2: Tentar buscar contas Instagram diretamente (se disponível)
+            logger.info("Tentando buscar contas Instagram diretamente...")
+            try:
+                # Tentar buscar através do Business Manager ou diretamente
+                ig_accounts_response = await client.get(
+                    "https://graph.facebook.com/v20.0/me",
+                    params={
+                        "access_token": long_lived_token,
+                        "fields": "instagram_accounts{id,username,name}"
+                    }
+                )
+                if ig_accounts_response.status_code == 200:
+                    ig_data = ig_accounts_response.json()
+                    logger.info(f"Dados de contas Instagram diretas: {ig_data}")
+                    if "instagram_accounts" in ig_data:
+                        for ig_acc in ig_data["instagram_accounts"].get("data", []):
+                            ig_account = InstagramAccount(
+                                id=ig_acc.get("id"),
+                                username=ig_acc.get("username"),
+                                name=ig_acc.get("name") or ig_acc.get("username")
+                            )
+                            # Evitar duplicatas
+                            if not any(acc.id == ig_account.id for acc in instagram_accounts):
+                                instagram_accounts.append(ig_account)
+                                logger.info(f"Conta Instagram adicionada (método direto): id={ig_account.id}, username={ig_account.username}")
+            except Exception as e:
+                logger.warning(f"Não foi possível buscar contas Instagram diretamente: {e}")
+            
             logger.info(f"Total de contas Instagram encontradas: {len(instagram_accounts)}")
+            for acc in instagram_accounts:
+                logger.info(f"  - {acc.id} (@{acc.username})")
             
             # 5. Gerar API key única
             api_key = str(uuid.uuid4())
@@ -241,16 +290,8 @@ async def instagram_process_callback(
                 "instagram_accounts": [
                     {
                         "id": acc.id,
-                        "username": acc.username,
-                        "name": acc.name
+                        "username": acc.username or ""
                     } for acc in instagram_accounts
-                ],
-                "pages": [
-                    {
-                        "id": page.id,
-                        "name": page.name,
-                        "instagram_business_account_id": page.instagram_business_account.id if page.instagram_business_account else None
-                    } for page in pages
                 ]
             })
             
@@ -259,33 +300,16 @@ async def instagram_process_callback(
             logger.info(f"  - API Key: {api_key}")
             logger.info(f"  - Contas Instagram: {len(instagram_accounts)}")
             for acc in instagram_accounts:
-                logger.info(f"    * {acc.id} - @{acc.username} - {acc.name}")
-            logger.info(f"  - Páginas: {len(pages)}")
-            for page in pages:
-                logger.info(f"    * {page.id} - {page.name}")
-                if page.instagram_business_account:
-                    logger.info(f"      Instagram: {page.instagram_business_account.id} - @{page.instagram_business_account.username}")
+                logger.info(f"    * ID: {acc.id} | Username: @{acc.username}")
             
-            # Preparar dados para retornar
+            # Preparar dados para retornar (apenas contas Instagram, sem páginas)
             response_data = {
                 "api_key": api_key,
                 "instagram_accounts": [
                     {
                         "id": acc.id,
-                        "username": acc.username or "",
-                        "name": acc.name or ""
+                        "username": acc.username or ""
                     } for acc in instagram_accounts
-                ],
-                "pages": [
-                    {
-                        "id": page.id,
-                        "name": page.name,
-                        "instagram_business_account": {
-                            "id": page.instagram_business_account.id,
-                            "username": page.instagram_business_account.username or "",
-                            "name": page.instagram_business_account.name or ""
-                        } if page.instagram_business_account else None
-                    } for page in pages
                 ],
                 "message": "Integração Instagram configurada com sucesso",
                 "status": "success"
@@ -294,7 +318,8 @@ async def instagram_process_callback(
             logger.info(f"📤 DADOS QUE SERÃO RETORNADOS:")
             logger.info(f"  - api_key: {response_data['api_key']}")
             logger.info(f"  - instagram_accounts count: {len(response_data['instagram_accounts'])}")
-            logger.info(f"  - pages count: {len(response_data['pages'])}")
+            for acc in response_data['instagram_accounts']:
+                logger.info(f"    * ID: {acc['id']} | Username: @{acc['username']}")
             logger.info(f"  - Response data: {json.dumps(response_data, indent=2)}")
             
             # Preparar dados para incluir na URL de callback (opcional)
