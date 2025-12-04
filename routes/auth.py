@@ -176,6 +176,7 @@ async def instagram_process_callback(
             await save_access_token(user_uid, long_lived_token)
             
             # 4. Buscar páginas do usuário
+            logger.info(f"Buscando páginas do usuário com token de longa duração...")
             pages_response = await client.get(
                 "https://graph.facebook.com/v20.0/me/accounts",
                 params={
@@ -184,12 +185,18 @@ async def instagram_process_callback(
                 }
             )
             
+            logger.info(f"Resposta da API Meta para /me/accounts: status={pages_response.status_code}")
+            
             pages = []
             instagram_accounts = []
             
             if pages_response.status_code == 200:
                 pages_data = pages_response.json()
+                logger.info(f"Dados brutos da API Meta: {pages_data}")
+                logger.info(f"Total de páginas retornadas: {len(pages_data.get('data', []))}")
+                
                 for page_data in pages_data.get("data", []):
+                    logger.info(f"Processando página: {page_data}")
                     page = InstagramPage(
                         id=page_data["id"],
                         name=page_data.get("name", "")
@@ -198,6 +205,7 @@ async def instagram_process_callback(
                     # Verifica se tem conta Instagram conectada
                     if "instagram_business_account" in page_data:
                         ig_account_data = page_data["instagram_business_account"]
+                        logger.info(f"Conta Instagram encontrada: {ig_account_data}")
                         ig_account = InstagramAccount(
                             id=ig_account_data["id"],
                             username=ig_account_data.get("username"),
@@ -205,8 +213,18 @@ async def instagram_process_callback(
                         )
                         page.instagram_business_account = ig_account
                         instagram_accounts.append(ig_account)
+                        logger.info(f"Conta Instagram adicionada: id={ig_account.id}, username={ig_account.username}")
+                    else:
+                        logger.info(f"Página {page_data.get('name')} não tem conta Instagram conectada")
                     
                     pages.append(page)
+                    logger.info(f"Página adicionada: id={page.id}, name={page.name}")
+            else:
+                error_data = pages_response.json() if pages_response.content else {}
+                logger.error(f"Erro ao buscar páginas: status={pages_response.status_code}, error={error_data}")
+            
+            logger.info(f"Total de páginas processadas: {len(pages)}")
+            logger.info(f"Total de contas Instagram encontradas: {len(instagram_accounts)}")
             
             # 5. Gerar API key única
             api_key = str(uuid.uuid4())
@@ -237,6 +255,16 @@ async def instagram_process_callback(
             })
             
             logger.info(f"Integração Instagram configurada para user_uid: {user_uid}")
+            logger.info(f"📊 RESUMO ANTES DE RETORNAR:")
+            logger.info(f"  - API Key: {api_key}")
+            logger.info(f"  - Contas Instagram: {len(instagram_accounts)}")
+            for acc in instagram_accounts:
+                logger.info(f"    * {acc.id} - @{acc.username} - {acc.name}")
+            logger.info(f"  - Páginas: {len(pages)}")
+            for page in pages:
+                logger.info(f"    * {page.id} - {page.name}")
+                if page.instagram_business_account:
+                    logger.info(f"      Instagram: {page.instagram_business_account.id} - @{page.instagram_business_account.username}")
             
             # Preparar dados para retornar
             response_data = {
@@ -262,6 +290,12 @@ async def instagram_process_callback(
                 "message": "Integração Instagram configurada com sucesso",
                 "status": "success"
             }
+            
+            logger.info(f"📤 DADOS QUE SERÃO RETORNADOS:")
+            logger.info(f"  - api_key: {response_data['api_key']}")
+            logger.info(f"  - instagram_accounts count: {len(response_data['instagram_accounts'])}")
+            logger.info(f"  - pages count: {len(response_data['pages'])}")
+            logger.info(f"  - Response data: {json.dumps(response_data, indent=2)}")
             
             # Preparar dados para incluir na URL de callback (opcional)
             callback_data = response_data.copy()
