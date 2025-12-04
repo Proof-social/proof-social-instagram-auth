@@ -5,8 +5,10 @@ Endpoints de autenticação OAuth Instagram/Meta
 import logging
 import uuid
 import httpx
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, Response, Response
 from typing import Optional
+from urllib.parse import urlencode
+import json
 from schemas.instagram import (
     InstagramLoginRequest,
     InstagramLoginResponse,
@@ -22,6 +24,8 @@ from core.security import (
 )
 from google.cloud import firestore
 import os
+from urllib.parse import urlencode
+import json
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -236,11 +240,42 @@ async def instagram_process_callback(
             
             logger.info(f"Integração Instagram configurada para user_uid: {user_uid}")
             
-            return InstagramCallbackResponse(
-                api_key=api_key,
-                instagram_accounts=instagram_accounts,
-                pages=pages,
-                message="Integração Instagram configurada com sucesso"
+            # Preparar dados para incluir na URL de callback
+            callback_data = {
+                "api_key": api_key,
+                "instagram_accounts": [
+                    {
+                        "id": acc.id,
+                        "username": acc.username or "",
+                        "name": acc.name or ""
+                    } for acc in instagram_accounts
+                ],
+                "pages": [
+                    {
+                        "id": page.id,
+                        "name": page.name,
+                        "instagram_business_account": {
+                            "id": page.instagram_business_account.id,
+                            "username": page.instagram_business_account.username or "",
+                            "name": page.instagram_business_account.name or ""
+                        } if page.instagram_business_account else None
+                    } for page in pages
+                ],
+                "message": "Integração Instagram configurada com sucesso",
+                "status": "success"
+            }
+            
+            # Codificar dados como JSON na query string
+            data_json = json.dumps(callback_data)
+            encoded_data = urlencode({"data": data_json})
+            
+            # Construir URL de callback com os dados
+            callback_url = f"{request.redirect_uri}?{encoded_data}"
+            
+            # Redirecionar para a URL de callback com os dados
+            return Response(
+                status_code=302,
+                headers={"Location": callback_url}
             )
             
     except HTTPException:
