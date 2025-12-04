@@ -5,7 +5,7 @@ Endpoints de autenticação OAuth Instagram/Meta
 import logging
 import uuid
 import httpx
-from fastapi import APIRouter, HTTPException, Header, Depends, Response
+from fastapi import APIRouter, HTTPException, Header, Depends
 from typing import Optional
 from urllib.parse import urlencode
 import json
@@ -238,8 +238,8 @@ async def instagram_process_callback(
             
             logger.info(f"Integração Instagram configurada para user_uid: {user_uid}")
             
-            # Preparar dados para incluir na URL de callback
-            callback_data = {
+            # Preparar dados para retornar
+            response_data = {
                 "api_key": api_key,
                 "instagram_accounts": [
                     {
@@ -263,18 +263,19 @@ async def instagram_process_callback(
                 "status": "success"
             }
             
-            # Codificar dados como JSON na query string
+            # Preparar dados para incluir na URL de callback (opcional)
+            callback_data = response_data.copy()
             data_json = json.dumps(callback_data)
             encoded_data = urlencode({"data": data_json})
             
             # Construir URL de callback com os dados
             callback_url = f"{request.redirect_uri}?{encoded_data}"
             
-            # Redirecionar para a URL de callback com os dados
-            return Response(
-                status_code=302,
-                headers={"Location": callback_url}
-            )
+            # Adicionar redirect_url na resposta
+            response_data["redirect_url"] = callback_url
+            
+            # Retornar JSON (frontend fará o redirect manualmente)
+            return response_data
             
     except HTTPException:
         raise
