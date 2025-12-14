@@ -284,10 +284,14 @@ async def instagram_process_callback(
                 long_token_data = long_token_response.json()
                 long_lived_token = long_token_data.get("access_token", short_lived_token)
                 
-                # 3. Salvar token no Secret Manager
-                await save_access_token(user_uid, long_lived_token)
+                # 3. Gerar API key única ANTES de salvar o token
+                api_key = str(uuid.uuid4())
+                logger.info(f"🔑 API Key gerada: {api_key}")
                 
-                # 4. Buscar contas Instagram do usuário
+                # 4. Salvar token no Secret Manager usando api_key
+                await save_access_token(api_key, long_lived_token)
+                
+                # 5. Buscar contas Instagram do usuário
                 logger.info(f"Buscando contas Instagram do usuário com token de longa duração...")
                 instagram_accounts = []
                 pages = []
@@ -295,13 +299,13 @@ async def instagram_process_callback(
                 # Método 1: Buscar através de páginas (método tradicional)
                 logger.info("Tentando buscar contas Instagram através de páginas...")
                 pages_response = await client.get(
-                "https://graph.facebook.com/v20.0/me/accounts",
-                params={
-                    "access_token": long_lived_token,
-                    "fields": "id,name,access_token,instagram_business_account{id,username,name}"
-                }
-            )
-            
+                    "https://graph.facebook.com/v20.0/me/accounts",
+                    params={
+                        "access_token": long_lived_token,
+                        "fields": "id,name,access_token,instagram_business_account{id,username,name}"
+                    }
+                )
+                
                 logger.info(f"Resposta da API Meta para /me/accounts: status={pages_response.status_code}")
                 
                 if pages_response.status_code == 200:
@@ -385,11 +389,8 @@ async def instagram_process_callback(
                 logger.info(f"Total de contas Instagram encontradas: {len(instagram_accounts)}")
                 for acc in instagram_accounts:
                     logger.info(f"  - {acc.id} (@{acc.username})")
-            
-                # 5. Gerar API key única
-                api_key = str(uuid.uuid4())
                 
-                # 6. Salvar integração no Firestore
+                # 6. Salvar integração no Firestore (api_key já foi gerada acima)
                 db = firestore.Client()
                 integration_ref = db.collection("integrations").document(user_uid)
                 integration_ref.set({

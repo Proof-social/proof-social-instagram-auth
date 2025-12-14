@@ -104,17 +104,17 @@ async def get_meta_config(user_uid: str) -> dict:
         raise ValueError(f"Erro ao buscar configurações: {e}")
 
 
-async def save_access_token(user_uid: str, access_token: str):
+async def save_access_token(api_key: str, access_token: str):
     """
-    Salva access token no Secret Manager
+    Salva access token no Secret Manager usando api_key como identificador
     
     Args:
-        user_uid: ID do usuário
+        api_key: API key única da integração
         access_token: Token de acesso do Meta
     """
     client = get_secret_manager_client()
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "proof-social-ai")
-    secret_id = f"proof-social-instagram-{user_uid}"
+    secret_id = f"proof-social-instagram-{api_key}"
     
     try:
         # Verifica se o secret já existe
@@ -139,7 +139,7 @@ async def save_access_token(user_uid: str, access_token: str):
             }
         )
         
-        logger.info(f"Token salvo no Secret Manager para user_uid: {user_uid}")
+        logger.info(f"Token salvo no Secret Manager para api_key: {api_key}")
     except Exception as e:
         logger.error(f"Erro ao salvar token no Secret Manager: {e}")
         raise ValueError(f"Erro ao salvar token: {e}")
