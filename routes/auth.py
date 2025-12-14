@@ -119,18 +119,29 @@ async def instagram_process_callback(
     try:
         # Log para debug
         logger.info(f"🔍 Validação de State:")
-        logger.info(f"  - State recebido: '{request.state}' (tipo: {type(request.state)}, len: {len(request.state) if request.state else 0})")
+        logger.info(f"  - State recebido (raw): '{request.state}' (tipo: {type(request.state)}, len: {len(request.state) if request.state else 0})")
         logger.info(f"  - User UID do token: '{user_uid}' (tipo: {type(user_uid)}, len: {len(user_uid) if user_uid else 0})")
-        logger.info(f"  - São iguais? {request.state == user_uid}")
+        
+        # Limpar state: Meta às vezes adiciona #_=_ ao final do state
+        # Remove fragmentos comuns do Meta (#_=_, #_=, etc)
+        cleaned_state = request.state
+        if cleaned_state:
+            # Remove fragmentos do Meta que podem ser adicionados na URL
+            cleaned_state = cleaned_state.split('#')[0]  # Remove tudo após #
+            cleaned_state = cleaned_state.rstrip('_=')   # Remove _= no final
+            cleaned_state = cleaned_state.strip()        # Remove espaços
+        
+        logger.info(f"  - State limpo: '{cleaned_state}'")
+        logger.info(f"  - São iguais? {cleaned_state == user_uid}")
         logger.info(f"  - State repr: {repr(request.state)}")
         logger.info(f"  - User UID repr: {repr(user_uid)}")
         
-        # Valida state
-        if request.state != user_uid:
-            logger.error(f"❌ State não corresponde! State: '{request.state}' != User UID: '{user_uid}'")
+        # Valida state (usando state limpo)
+        if cleaned_state != user_uid:
+            logger.error(f"❌ State não corresponde! State (limpo): '{cleaned_state}' != User UID: '{user_uid}'")
             raise HTTPException(
                 status_code=400,
-                detail=f"State não corresponde ao usuário autenticado. State recebido: '{request.state}', User UID esperado: '{user_uid}'"
+                detail=f"State não corresponde ao usuário autenticado. State recebido: '{request.state}', State limpo: '{cleaned_state}', User UID esperado: '{user_uid}'"
             )
         
         logger.info(f"✅ State validado com sucesso!")
