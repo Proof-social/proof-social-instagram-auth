@@ -114,7 +114,7 @@ async def save_access_token(api_key: str, access_token: str):
     """
     client = get_secret_manager_client()
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "proof-social-ai")
-    secret_id = f"proof-social-instagram-{api_key}"
+    secret_id = api_key  # Usa apenas a api_key sem sufixo
     
     try:
         # Verifica se o secret já existe
