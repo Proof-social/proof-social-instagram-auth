@@ -55,7 +55,7 @@ async def verify_firebase_token(authorization: str) -> str:
         if not user_uid:
             raise ValueError("Token não contém user_uid")
         
-        logger.info(f"Token Firebase validado para user_uid: {user_uid}")
+        logger.info(f"✅ Token Firebase validado para user_uid: {user_uid} (tipo: {type(user_uid)}, len: {len(user_uid) if user_uid else 0})")
         return user_uid
         
     except auth.InvalidIdTokenError as e:

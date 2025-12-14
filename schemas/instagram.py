@@ -43,4 +43,5 @@ class InstagramCallbackResponse(BaseModel):
     instagram_accounts: List[InstagramAccount]
     message: str
     status: str
+    redirect_url: Optional[str] = None
 

@@ -77,6 +77,11 @@ async def instagram_login(
         scopes = ",".join(INSTAGRAM_SCOPES)
         state = user_uid  # Usa user_uid como state para validação
         
+        logger.info(f"🔐 Gerando URL de autorização:")
+        logger.info(f"  - User UID: '{user_uid}' (tipo: {type(user_uid)}, len: {len(user_uid) if user_uid else 0})")
+        logger.info(f"  - State que será usado: '{state}' (tipo: {type(state)}, len: {len(state) if state else 0})")
+        logger.info(f"  - Redirect URI: '{request.redirect_uri}'")
+        
         auth_url = (
             f"https://www.facebook.com/v20.0/dialog/oauth?"
             f"client_id={app_id}&"
@@ -86,7 +91,8 @@ async def instagram_login(
             f"scope={scopes}"
         )
         
-        logger.info(f"URL de autorização gerada para user_uid: {user_uid}")
+        logger.info(f"✅ URL de autorização gerada para user_uid: {user_uid}")
+        logger.info(f"  - Auth URL contém state: {state in auth_url}")
         
         return InstagramLoginResponse(auth_url=auth_url)
         
@@ -111,12 +117,23 @@ async def instagram_process_callback(
         Dados da integração configurada
     """
     try:
+        # Log para debug
+        logger.info(f"🔍 Validação de State:")
+        logger.info(f"  - State recebido: '{request.state}' (tipo: {type(request.state)}, len: {len(request.state) if request.state else 0})")
+        logger.info(f"  - User UID do token: '{user_uid}' (tipo: {type(user_uid)}, len: {len(user_uid) if user_uid else 0})")
+        logger.info(f"  - São iguais? {request.state == user_uid}")
+        logger.info(f"  - State repr: {repr(request.state)}")
+        logger.info(f"  - User UID repr: {repr(user_uid)}")
+        
         # Valida state
         if request.state != user_uid:
+            logger.error(f"❌ State não corresponde! State: '{request.state}' != User UID: '{user_uid}'")
             raise HTTPException(
                 status_code=400,
-                detail="State não corresponde ao usuário autenticado"
+                detail=f"State não corresponde ao usuário autenticado. State recebido: '{request.state}', User UID esperado: '{user_uid}'"
             )
+        
+        logger.info(f"✅ State validado com sucesso!")
         
         # Busca configurações Meta
         config = await get_meta_config(user_uid)
