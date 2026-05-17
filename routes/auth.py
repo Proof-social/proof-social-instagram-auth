@@ -24,6 +24,7 @@ from core.security import (
     get_meta_config,
     save_access_token
 )
+from core.state import generate_state, validate_state, InvalidStateError
 from google.cloud import firestore
 import os
 
@@ -78,16 +79,16 @@ async def instagram_login(
         # Busca configurações Meta
         config = await get_meta_config(user_uid)
         app_id = config["app_id"]
-        
-        # Gera URL de autorização
+
+        # State assinado com HMAC + nonce + ts. Não vaza uid pra atacante observando URL.
+        # TTL de 10min default; se user demora mais que isso, refaz login.
         scopes = ",".join(INSTAGRAM_SCOPES)
-        state = user_uid  # Usa user_uid como state para validação
-        
-        logger.info(f"🔐 Gerando URL de autorização:")
-        logger.info(f"  - User UID: '{user_uid}' (tipo: {type(user_uid)}, len: {len(user_uid) if user_uid else 0})")
-        logger.info(f"  - State que será usado: '{state}' (tipo: {type(state)}, len: {len(state) if state else 0})")
-        logger.info(f"  - Redirect URI: '{request.redirect_uri}'")
-        
+        try:
+            state = generate_state(user_uid)
+        except Exception as e:
+            logger.error("Falha ao gerar state OAuth: %s", e)
+            raise HTTPException(status_code=503, detail="Server misconfigured: state signing key ausente")
+
         auth_url = (
             f"https://www.facebook.com/v20.0/dialog/oauth?"
             f"client_id={app_id}&"
@@ -96,14 +97,14 @@ async def instagram_login(
             f"response_type=code&"
             f"scope={scopes}"
         )
-        
-        logger.info(f"✅ URL de autorização gerada para user_uid: {user_uid}")
-        logger.info(f"  - Auth URL contém state: {state in auth_url}")
-        
+
+        logger.info("OAuth login URL gerada user_uid=%s", user_uid)
         return InstagramLoginResponse(auth_url=auth_url)
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Erro ao gerar URL de autorização: {e}")
+        logger.error("Erro ao gerar URL de autorização: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erro ao gerar URL de autorização: {str(e)}")
 
 
@@ -123,34 +124,23 @@ async def instagram_process_callback(
         Dados da integração configurada
     """
     try:
-        # Log para debug
-        logger.info(f"🔍 Validação de State:")
-        logger.info(f"  - State recebido (raw): '{request.state}' (tipo: {type(request.state)}, len: {len(request.state) if request.state else 0})")
-        logger.info(f"  - User UID do token: '{user_uid}' (tipo: {type(user_uid)}, len: {len(user_uid) if user_uid else 0})")
-        
-        # Limpar state: Meta às vezes adiciona #_=_ ao final do state
-        # Remove fragmentos comuns do Meta (#_=_, #_=, etc)
-        cleaned_state = request.state
-        if cleaned_state:
-            # Remove fragmentos do Meta que podem ser adicionados na URL
-            cleaned_state = cleaned_state.split('#')[0]  # Remove tudo após #
-            cleaned_state = cleaned_state.rstrip('_=')   # Remove _= no final
-            cleaned_state = cleaned_state.strip()        # Remove espaços
-        
-        logger.info(f"  - State limpo: '{cleaned_state}'")
-        logger.info(f"  - São iguais? {cleaned_state == user_uid}")
-        logger.info(f"  - State repr: {repr(request.state)}")
-        logger.info(f"  - User UID repr: {repr(user_uid)}")
-        
-        # Valida state (usando state limpo)
-        if cleaned_state != user_uid:
-            logger.error(f"❌ State não corresponde! State (limpo): '{cleaned_state}' != User UID: '{user_uid}'")
+        # Limpar fragmento `#_=_` que Meta às vezes adiciona ao state.
+        cleaned_state = request.state or ""
+        cleaned_state = cleaned_state.split("#")[0].rstrip("_=").strip()
+
+        # Validação real: HMAC + ts + uid bate com o autenticado.
+        # Detecção precoce CSRF: atacante não consegue forjar state válido sem
+        # a signing key.
+        try:
+            validate_state(state=cleaned_state, user_uid=user_uid)
+        except InvalidStateError as e:
+            logger.warning("OAuth state inválido user_uid=%s reason=%s", user_uid, e)
             raise HTTPException(
                 status_code=400,
-                detail=f"State não corresponde ao usuário autenticado. State recebido: '{request.state}', State limpo: '{cleaned_state}', User UID esperado: '{user_uid}'"
+                detail=f"State inválido ou expirado: {e}",
             )
-        
-        logger.info(f"✅ State validado com sucesso!")
+
+        logger.info("OAuth state validado user_uid=%s", user_uid)
         
         # Proteção contra chamadas duplicadas: usar lock por código
         code_key = f"{user_uid}:{request.code}"
