@@ -35,9 +35,8 @@ steps:
       - '10'
       # Auth via Firebase ID Token + OAuth state HMAC dentro da aplicação.
       - '--allow-unauthenticated'
-      - '--set-env-vars'
-      - 'GOOGLE_CLOUD_PROJECT=proof-social-ai'
-      - '--no-clear-env-vars'
+      # Não tocamos em env vars aqui — são configuradas via gcloud run services
+      # update separadamente (ver OPS_RUNBOOK) para evitar sobrescrever segredos.
       - '--quiet'
 
 images:
