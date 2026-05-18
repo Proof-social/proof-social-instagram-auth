@@ -193,9 +193,11 @@ async def instagram_process_callback(
                 {
                     "id": account.id,
                     "username": account.username or "",
+                    "name": profile.get("name") or account.username or "",
                     "account_type": profile.get("account_type", "BUSINESS"),
                     "followers_count": profile.get("followers_count", 0),
                     "media_count": profile.get("media_count", 0),
+                    "profile_picture_url": profile.get("profile_picture_url") or "",
                 }
             ],
             "token_expires_in_seconds": expires_in,
@@ -307,7 +309,7 @@ async def _fetch_instagram_profile(
     resp = await client.get(
         INSTAGRAM_GRAPH_ME_URL,
         params={
-            "fields": "id,username,account_type,followers_count,media_count",
+            "fields": "id,username,account_type,followers_count,media_count,profile_picture_url,name",
             "access_token": long_token,
         },
     )
