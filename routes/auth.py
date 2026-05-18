@@ -68,7 +68,11 @@ INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v20.0/me"
 async def get_user_uid(authorization: Optional[str] = Header(None)) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Token de autorização não fornecido")
-    return await verify_firebase_token(authorization)
+    try:
+        return await verify_firebase_token(authorization)
+    except ValueError as e:
+        # Sem isso, ValueError vira 500. Convertendo para 401 padronizado.
+        raise HTTPException(status_code=401, detail=f"Token inválido: {e}")
 
 
 @router.post("/instagram/login", response_model=InstagramLoginResponse)
