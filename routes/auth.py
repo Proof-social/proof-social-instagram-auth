@@ -1,60 +1,71 @@
-"""
-Endpoints de autenticação OAuth Instagram/Meta
+"""Endpoints de autenticação OAuth Instagram (Instagram Login API).
+
+Migrado de Facebook Login for Business → Instagram Login API.
+
+Vantagens:
+- User não precisa de Facebook Page nem Business Manager
+- Autoriza direto no instagram.com
+- Scopes Instagram-only (mais simples no App Review)
+
+Requer:
+- Instagram account Business ou Creator (conta pessoal nunca funciona)
+- Produto "Instagram" habilitado no Meta App Dashboard (client_id próprio)
+
+Doc: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login
 """
 
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
 import uuid
-import httpx
-from fastapi import APIRouter, HTTPException, Header, Depends
+from collections import defaultdict
 from typing import Optional
 from urllib.parse import urlencode
-import json
-from collections import defaultdict
-import asyncio
+
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException
+from google.cloud import firestore
+
+from core.instagram_config import get_instagram_config
+from core.security import save_access_token, verify_firebase_token
+from core.state import generate_state, validate_state, InvalidStateError
 from schemas.instagram import (
-    InstagramLoginRequest,
-    InstagramLoginResponse,
+    InstagramAccount,
     InstagramCallbackRequest,
     InstagramCallbackResponse,
-    InstagramAccount,
-    InstagramPage
+    InstagramLoginRequest,
+    InstagramLoginResponse,
 )
-from core.security import (
-    verify_firebase_token,
-    get_meta_config,
-    save_access_token
-)
-from core.state import generate_state, validate_state, InvalidStateError
-from google.cloud import firestore
-import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Cache para evitar processar o mesmo código simultaneamente
-# (proteção contra chamadas duplicadas do React Strict Mode)
-processing_codes = defaultdict(asyncio.Lock)
+# Lock por código pra evitar processar o mesmo code 2x (React Strict Mode).
+processing_codes: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-# Permissões Instagram/Meta necessárias
+# Scopes do Instagram Login API. Cobertura para o que o Proof precisa:
+# - basic: id, username, account_type
+# - manage_insights: profile + media insights
+# - manage_comments: ler/responder comments
+# - manage_messages: DMs (futuro)
+# - content_publish: publish (futuro, exige App Review)
 INSTAGRAM_SCOPES = [
-    "pages_show_list",
-    "ads_management",
-    "ads_read",
-    "instagram_basic",
-    "instagram_manage_comments",
-    "instagram_manage_insights",
-    "instagram_content_publish",
-    "instagram_manage_messages",
-    "pages_read_engagement",
-    "pages_manage_ads",
-    "instagram_branded_content_ads_brand",
-    "instagram_manage_events",
-    "business_management"  # Necessário para acessar contas Instagram selecionadas
+    "instagram_business_basic",
+    "instagram_business_manage_insights",
+    "instagram_business_manage_comments",
+    "instagram_business_manage_messages",
+    "instagram_business_content_publish",
 ]
+
+INSTAGRAM_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
+INSTAGRAM_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+INSTAGRAM_GRAPH_LONG_TOKEN_URL = "https://graph.instagram.com/access_token"
+INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v20.0/me"
 
 
 async def get_user_uid(authorization: Optional[str] = Header(None)) -> str:
-    """Dependency para validar Firebase token e retornar user_uid"""
     if not authorization:
         raise HTTPException(status_code=401, detail="Token de autorização não fornecido")
     return await verify_firebase_token(authorization)
@@ -63,387 +74,268 @@ async def get_user_uid(authorization: Optional[str] = Header(None)) -> str:
 @router.post("/instagram/login", response_model=InstagramLoginResponse)
 async def instagram_login(
     request: InstagramLoginRequest,
-    user_uid: str = Depends(get_user_uid)
+    user_uid: str = Depends(get_user_uid),
 ):
-    """
-    Gera URL de autorização Meta/Instagram OAuth
-    
-    Args:
-        request: Contém redirect_uri
-        user_uid: Extraído do token Firebase
-        
-    Returns:
-        URL de autorização Meta
+    """Gera URL de autorização Instagram Login API.
+
+    Body: {"redirect_uri": "..."}
+    Retorna: {"auth_url": "https://www.instagram.com/oauth/authorize?..."}
     """
     try:
-        # Busca configurações Meta
-        config = await get_meta_config(user_uid)
-        app_id = config["app_id"]
-
-        # State assinado com HMAC + nonce + ts. Não vaza uid pra atacante observando URL.
-        # TTL de 10min default; se user demora mais que isso, refaz login.
-        scopes = ",".join(INSTAGRAM_SCOPES)
+        config = get_instagram_config()
         try:
             state = generate_state(user_uid)
         except Exception as e:
             logger.error("Falha ao gerar state OAuth: %s", e)
-            raise HTTPException(status_code=503, detail="Server misconfigured: state signing key ausente")
+            raise HTTPException(
+                status_code=503,
+                detail="Server misconfigured: OAUTH_STATE_SIGNING_KEY ausente",
+            )
 
-        auth_url = (
-            f"https://www.facebook.com/v20.0/dialog/oauth?"
-            f"client_id={app_id}&"
-            f"redirect_uri={request.redirect_uri}&"
-            f"state={state}&"
-            f"response_type=code&"
-            f"scope={scopes}"
-        )
+        params = {
+            "enable_fb_login": "0",
+            "force_authentication": "1",
+            "client_id": config["app_id"],
+            "redirect_uri": request.redirect_uri,
+            "response_type": "code",
+            "scope": ",".join(INSTAGRAM_SCOPES),
+            "state": state,
+        }
+        auth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
 
-        logger.info("OAuth login URL gerada user_uid=%s", user_uid)
+        logger.info("Instagram OAuth URL gerada user_uid=%s", user_uid)
         return InstagramLoginResponse(auth_url=auth_url)
-
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Erro ao gerar URL de autorização: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar URL de autorização: {str(e)}")
+        logger.error("Erro ao gerar URL Instagram OAuth: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erro: {str(e)}")
 
 
 @router.post("/instagram/process-callback", response_model=InstagramCallbackResponse)
 async def instagram_process_callback(
     request: InstagramCallbackRequest,
-    user_uid: str = Depends(get_user_uid)
+    user_uid: str = Depends(get_user_uid),
 ):
-    """
-    Processa callback OAuth e configura integração Instagram
-    
-    Args:
-        request: Contém code e state do callback
-        user_uid: Extraído do token Firebase
-        
-    Returns:
-        Dados da integração configurada
-    """
-    try:
-        # Limpar fragmento `#_=_` que Meta às vezes adiciona ao state.
-        cleaned_state = request.state or ""
-        cleaned_state = cleaned_state.split("#")[0].rstrip("_=").strip()
+    """Processa callback OAuth Instagram Login API e configura integração.
 
-        # Validação real: HMAC + ts + uid bate com o autenticado.
-        # Detecção precoce CSRF: atacante não consegue forjar state válido sem
-        # a signing key.
-        try:
-            validate_state(state=cleaned_state, user_uid=user_uid)
-        except InvalidStateError as e:
-            logger.warning("OAuth state inválido user_uid=%s reason=%s", user_uid, e)
-            raise HTTPException(
-                status_code=400,
-                detail=f"State inválido ou expirado: {e}",
+    Body: {"code": "...", "state": "...", "redirect_uri": "..."}
+    """
+    # Limpa fragmento `#_=_` que Meta às vezes adiciona.
+    cleaned_state = (request.state or "").split("#")[0].rstrip("_=").strip()
+
+    try:
+        validate_state(state=cleaned_state, user_uid=user_uid)
+    except InvalidStateError as e:
+        logger.warning("OAuth state inválido user_uid=%s reason=%s", user_uid, e)
+        raise HTTPException(status_code=400, detail=f"State inválido ou expirado: {e}")
+
+    db = firestore.Client()
+    integration_ref = db.collection("integrations").document(user_uid)
+    existing = integration_ref.get()
+
+    # Idempotência: se já existe integração criada há < 5min, retorna a anterior
+    # (proteção contra React Strict Mode chamando duas vezes em dev).
+    if existing.exists:
+        data = existing.to_dict() or {}
+        created_at = data.get("created_at")
+        if isinstance(created_at, _dt_module().datetime):
+            age = (_dt_module().datetime.now(_dt_module().timezone.utc) - created_at).total_seconds()
+            if age < 300:
+                logger.info(
+                    "Integration existente há %.0fs — retornando dados (dedupe Strict Mode)",
+                    age,
+                )
+                return _build_response_from_doc(data, message="Integração já configurada.")
+
+    config = get_instagram_config()
+    app_id = config["app_id"]
+    app_secret = config["app_secret"]
+
+    code_key = f"{user_uid}:{request.code}"
+    async with processing_codes[code_key]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            short_token, ig_user_id = await _exchange_code_for_short_token(
+                client, app_id, app_secret, request.code, request.redirect_uri,
+                existing_doc=existing,
             )
 
-        logger.info("OAuth state validado user_uid=%s", user_uid)
-        
-        # Proteção contra chamadas duplicadas: usar lock por código
-        code_key = f"{user_uid}:{request.code}"
-        
-        # Verificar se já existe integração recente (proteção contra React Strict Mode)
-        db = firestore.Client()
-        integration_ref = db.collection("integrations").document(user_uid)
-        existing_integration = integration_ref.get()
-        
-        if existing_integration.exists:
-            integration_data = existing_integration.to_dict()
-            created_at = integration_data.get("created_at")
-            if created_at:
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc)
-                if isinstance(created_at, datetime):
-                    time_diff = (now - created_at).total_seconds()
-                    if time_diff < 300:  # 5 minutos
-                        logger.info(f"✅ Integração criada há {time_diff:.0f}s. Retornando dados existentes (proteção contra duplicatas do React Strict Mode).")
-                        
-                        instagram_accounts_data = integration_data.get("instagram_accounts", [])
-                        instagram_accounts = [
-                            InstagramAccount(
-                                id=acc.get("id", ""),
-                                username=acc.get("username"),
-                                name=acc.get("name")
-                            ) for acc in instagram_accounts_data
-                        ]
-                        
-                        return InstagramCallbackResponse(
-                            api_key=integration_data.get("api_key", ""),
-                            instagram_accounts=instagram_accounts,
-                            message="Integração já configurada. Retornando dados existentes.",
-                            status="success"
-                        )
-        
-        # Busca configurações Meta
-        config = await get_meta_config(user_uid)
-        app_id = config["app_id"]
-        app_secret = config["app_secret"]
-        
-        # Troca code por access_token (com lock para evitar processamento simultâneo)
-        async with processing_codes[code_key]:
-            logger.info(f"🔒 Processando callback com código (lock adquirido para: {code_key[:20]}...)")
-            
-            async with httpx.AsyncClient() as client:
-                # 1. Trocar code por access_token de curta duração
-                token_response = await client.get(
-                    "https://graph.facebook.com/v20.0/oauth/access_token",
-                    params={
-                        "client_id": app_id,
-                        "client_secret": app_secret,
-                        "redirect_uri": request.redirect_uri,
-                        "code": request.code
-                    }
-                )
-                
-                if token_response.status_code != 200:
-                    error_data = token_response.json() if token_response.content else {}
-                    error_message = error_data.get("error", {}).get("message", "")
-                    error_code = error_data.get("error", {}).get("code", 0)
-                    error_subcode = error_data.get("error", {}).get("error_subcode", 0)
-                    
-                    # Verificar se o código já foi usado (erro 100, subcode 36009)
-                    if error_code == 100 and error_subcode == 36009:
-                        logger.warning(f"⚠️ Código de autorização já foi usado. Verificando se já existe integração...")
-                        
-                        # Se já existe integração, retornar os dados existentes
-                        if existing_integration.exists:
-                            integration_data = existing_integration.to_dict()
-                            logger.info(f"✅ Integração já existe para user_uid: {user_uid}. Retornando dados existentes.")
-                            
-                            # Buscar contas Instagram da integração existente
-                            instagram_accounts_data = integration_data.get("instagram_accounts", [])
-                            instagram_accounts = [
-                                InstagramAccount(
-                                    id=acc.get("id", ""),
-                                    username=acc.get("username"),
-                                    name=acc.get("name")
-                                ) for acc in instagram_accounts_data
-                            ]
-                            
-                            return InstagramCallbackResponse(
-                                api_key=integration_data.get("api_key", ""),
-                                instagram_accounts=instagram_accounts,
-                                message="Integração já configurada. Retornando dados existentes.",
-                                status="success"
-                            )
-                        else:
-                            # Código foi usado mas não há integração - pode ser chamada duplicada
-                            logger.error(f"❌ Código já foi usado mas não há integração. Possível chamada duplicada.")
-                            raise HTTPException(
-                                status_code=400,
-                                detail="Este código de autorização já foi usado. Por favor, inicie o fluxo de autenticação novamente."
-                            )
-                    
-                    # Outros erros
-                    logger.error(f"❌ Erro ao trocar code por token: {error_data}")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Erro ao trocar code por token: {error_data}"
-                    )
-                
-                token_data = token_response.json()
-                short_lived_token = token_data.get("access_token")
-                
-                if not short_lived_token:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Token de acesso não retornado pela API Meta"
-                    )
-                
-                # 2. Converter para token de longa duração
-                long_token_response = await client.get(
-                    "https://graph.facebook.com/v20.0/oauth/access_token",
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": app_id,
-                        "client_secret": app_secret,
-                        "fb_exchange_token": short_lived_token
-                    }
-                )
-                
-                if long_token_response.status_code != 200:
-                    error_data = long_token_response.json() if long_token_response.content else {}
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Erro ao converter para token de longa duração: {error_data}"
-                    )
-                
-                long_token_data = long_token_response.json()
-                long_lived_token = long_token_data.get("access_token", short_lived_token)
-                
-                # 3. Gerar API key única ANTES de salvar o token
-                api_key = str(uuid.uuid4())
-                logger.info(f"🔑 API Key gerada: {api_key}")
-                
-                # 4. Salvar token no Secret Manager usando api_key
-                await save_access_token(api_key, long_lived_token)
-                
-                # 5. Buscar contas Instagram do usuário
-                logger.info(f"Buscando contas Instagram do usuário com token de longa duração...")
-                instagram_accounts = []
-                pages = []
-                
-                # Método 1: Buscar através de páginas (método tradicional)
-                logger.info("Tentando buscar contas Instagram através de páginas...")
-                pages_response = await client.get(
-                    "https://graph.facebook.com/v20.0/me/accounts",
-                    params={
-                        "access_token": long_lived_token,
-                        "fields": "id,name,access_token,instagram_business_account{id,username,name}"
-                    }
-                )
-                
-                logger.info(f"Resposta da API Meta para /me/accounts: status={pages_response.status_code}")
-                
-                if pages_response.status_code == 200:
-                    pages_data = pages_response.json()
-                    logger.info(f"Dados brutos da API Meta (/me/accounts): {pages_data}")
-                    logger.info(f"Total de páginas retornadas: {len(pages_data.get('data', []))}")
-                    
-                    for page_data in pages_data.get("data", []):
-                        logger.info(f"Processando página: {page_data}")
-                        
-                        # Verifica se tem conta Instagram conectada
-                        if "instagram_business_account" in page_data:
-                            ig_account_data = page_data["instagram_business_account"]
-                            logger.info(f"Conta Instagram encontrada na página: {ig_account_data}")
-                            
-                            # Buscar username completo se não estiver disponível
-                            ig_account_id = ig_account_data.get("id")
-                            ig_username = ig_account_data.get("username")
-                            
-                            # Se não tiver username, buscar diretamente da conta Instagram
-                            if not ig_username and ig_account_id:
-                                logger.info(f"Buscando username da conta Instagram {ig_account_id}...")
-                                ig_account_response = await client.get(
-                                    f"https://graph.facebook.com/v20.0/{ig_account_id}",
-                                    params={
-                                        "access_token": long_lived_token,
-                                        "fields": "id,username,name"
-                                    }
-                                )
-                                if ig_account_response.status_code == 200:
-                                    ig_account_info = ig_account_response.json()
-                                    ig_username = ig_account_info.get("username")
-                                    logger.info(f"Username obtido: {ig_username}")
-                            
-                            ig_account = InstagramAccount(
-                                id=ig_account_id,
-                                username=ig_username,
-                                name=ig_account_data.get("name") or ig_account_data.get("username")
-                            )
-                            
-                            # Evitar duplicatas
-                            if not any(acc.id == ig_account.id for acc in instagram_accounts):
-                                instagram_accounts.append(ig_account)
-                                logger.info(f"Conta Instagram adicionada: id={ig_account.id}, username={ig_account.username}")
-                            else:
-                                logger.info(f"Conta Instagram já existe, ignorando duplicata: {ig_account.id}")
-                        else:
-                            logger.info(f"Página {page_data.get('name')} não tem conta Instagram conectada")
-                else:
-                    error_data = pages_response.json() if pages_response.content else {}
-                    logger.warning(f"Erro ao buscar páginas: status={pages_response.status_code}, error={error_data}")
-                
-                # Método 2: Tentar buscar contas Instagram diretamente (se disponível)
-                logger.info("Tentando buscar contas Instagram diretamente...")
-                try:
-                    # Tentar buscar através do Business Manager ou diretamente
-                    ig_accounts_response = await client.get(
-                        "https://graph.facebook.com/v20.0/me",
-                        params={
-                            "access_token": long_lived_token,
-                            "fields": "instagram_accounts{id,username,name}"
-                        }
-                    )
-                    if ig_accounts_response.status_code == 200:
-                        ig_data = ig_accounts_response.json()
-                        logger.info(f"Dados de contas Instagram diretas: {ig_data}")
-                        if "instagram_accounts" in ig_data:
-                            for ig_acc in ig_data["instagram_accounts"].get("data", []):
-                                ig_account = InstagramAccount(
-                                    id=ig_acc.get("id"),
-                                    username=ig_acc.get("username"),
-                                    name=ig_acc.get("name") or ig_acc.get("username")
-                                )
-                                # Evitar duplicatas
-                                if not any(acc.id == ig_account.id for acc in instagram_accounts):
-                                    instagram_accounts.append(ig_account)
-                                    logger.info(f"Conta Instagram adicionada (método direto): id={ig_account.id}, username={ig_account.username}")
-                except Exception as e:
-                    logger.warning(f"Não foi possível buscar contas Instagram diretamente: {e}")
-                
-                logger.info(f"Total de contas Instagram encontradas: {len(instagram_accounts)}")
-                for acc in instagram_accounts:
-                    logger.info(f"  - {acc.id} (@{acc.username})")
-                
-                # 6. Salvar integração no Firestore (api_key já foi gerada acima)
-                db = firestore.Client()
-                integration_ref = db.collection("integrations").document(user_uid)
-                integration_ref.set({
-                    "user_uid": user_uid,
-                    "platform": "instagram",
-                    "api_key": api_key,
-                    "status": "active",
-                    "created_at": firestore.SERVER_TIMESTAMP,
-                    "instagram_accounts": [
-                        {
-                            "id": acc.id,
-                            "username": acc.username or ""
-                        } for acc in instagram_accounts
-                    ]
-                })
-                
-                logger.info(f"Integração Instagram configurada para user_uid: {user_uid}")
-                logger.info(f"📊 RESUMO ANTES DE RETORNAR:")
-                logger.info(f"  - API Key: {api_key}")
-                logger.info(f"  - Contas Instagram: {len(instagram_accounts)}")
-                for acc in instagram_accounts:
-                    logger.info(f"    * ID: {acc.id} | Username: @{acc.username}")
-                
-                # Preparar dados para retornar (apenas contas Instagram, sem páginas)
-                response_data = {
-                    "api_key": api_key,
-                    "instagram_accounts": [
-                        {
-                            "id": acc.id,
-                            "username": acc.username or ""
-                        } for acc in instagram_accounts
-                    ],
-                    "message": "Integração Instagram configurada com sucesso",
-                    "status": "success"
-                }
-                
-                logger.info(f"📤 DADOS QUE SERÃO RETORNADOS:")
-                logger.info(f"  - api_key: {response_data['api_key']}")
-                logger.info(f"  - instagram_accounts count: {len(response_data['instagram_accounts'])}")
-                for acc in response_data['instagram_accounts']:
-                    logger.info(f"    * ID: {acc['id']} | Username: @{acc['username']}")
-                logger.info(f"  - Response data: {json.dumps(response_data, indent=2)}")
-                
-                # Preparar dados para incluir na URL de callback (opcional)
-                callback_data = response_data.copy()
-                data_json = json.dumps(callback_data)
-                encoded_data = urlencode({"data": data_json})
-                
-                # Construir URL de callback com os dados
-                callback_url = f"{request.redirect_uri}?{encoded_data}"
-                
-                # Adicionar redirect_url na resposta
-                response_data["redirect_url"] = callback_url
-                
-                # Retornar JSON (frontend fará o redirect manualmente)
-                return response_data
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erro ao processar callback: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erro ao processar callback: {str(e)}"
+            long_token, expires_in = await _exchange_short_for_long_token(
+                client, app_secret, short_token,
+            )
+
+            profile = await _fetch_instagram_profile(client, long_token)
+
+        api_key = str(uuid.uuid4())
+        await save_access_token(api_key, long_token)
+
+        # Persiste a integration. Esquema mantém `instagram_accounts` como array
+        # de 1 elemento (Instagram Login API autoriza 1 conta por vez).
+        # Pra adicionar outra conta, user faz OAuth de novo (sobrescreve).
+        account = InstagramAccount(
+            id=str(profile.get("id") or ig_user_id),
+            username=profile.get("username"),
+            name=profile.get("username"),  # IG Login API não devolve "name" separado
         )
 
+        integration_ref.set({
+            "user_uid": user_uid,
+            "platform": "instagram",
+            "auth_provider": "instagram_login_api",  # marker pra diferenciar do legado FB
+            "api_key": api_key,
+            "status": "active",
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "instagram_accounts": [
+                {
+                    "id": account.id,
+                    "username": account.username or "",
+                    "account_type": profile.get("account_type", "BUSINESS"),
+                    "followers_count": profile.get("followers_count", 0),
+                    "media_count": profile.get("media_count", 0),
+                }
+            ],
+            "token_expires_in_seconds": expires_in,
+        })
+
+        logger.info(
+            "Instagram integration configurada user_uid=%s ig_id=%s @%s",
+            user_uid, account.id, account.username,
+        )
+
+        return InstagramCallbackResponse(
+            api_key=api_key,
+            instagram_accounts=[account],
+            message="Integração Instagram configurada com sucesso",
+            status="success",
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Helpers HTTP                                                                #
+# --------------------------------------------------------------------------- #
+
+
+async def _exchange_code_for_short_token(
+    client: httpx.AsyncClient,
+    app_id: str,
+    app_secret: str,
+    code: str,
+    redirect_uri: str,
+    *,
+    existing_doc,
+) -> tuple[str, str]:
+    """POST x-www-form-urlencoded para api.instagram.com/oauth/access_token.
+
+    Retorna (short_token, ig_user_id).
+    """
+    resp = await client.post(
+        INSTAGRAM_TOKEN_URL,
+        data={
+            "client_id": app_id,
+            "client_secret": app_secret,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+            "code": code,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    if resp.status_code != 200:
+        body = resp.json() if resp.content else {}
+        error_msg = body.get("error_message") or body.get("error", {}).get("message", "")
+        # Code reusage: IG retorna "Authorization code has been used"
+        if "has been used" in str(error_msg).lower() and existing_doc and existing_doc.exists:
+            data = existing_doc.to_dict() or {}
+            logger.warning("Código já usado; devolvendo integração existente")
+            response_data = _build_response_from_doc(data, message="Integração já configurada.")
+            # Lança HTTPException pra interromper o fluxo principal
+            raise HTTPException(status_code=200, detail=response_data.model_dump())
+        logger.error("IG /oauth/access_token retornou %d: %s", resp.status_code, body)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Erro ao trocar code por token: {body}",
+        )
+
+    payload = resp.json()
+    short_token = payload.get("access_token")
+    ig_user_id = str(payload.get("user_id") or "")
+    if not short_token:
+        raise HTTPException(status_code=400, detail="Resposta sem access_token")
+    return short_token, ig_user_id
+
+
+async def _exchange_short_for_long_token(
+    client: httpx.AsyncClient,
+    app_secret: str,
+    short_token: str,
+) -> tuple[str, int]:
+    """GET graph.instagram.com/access_token?grant_type=ig_exchange_token.
+
+    Retorna (long_token, expires_in_seconds).
+    """
+    resp = await client.get(
+        INSTAGRAM_GRAPH_LONG_TOKEN_URL,
+        params={
+            "grant_type": "ig_exchange_token",
+            "client_secret": app_secret,
+            "access_token": short_token,
+        },
+    )
+    if resp.status_code != 200:
+        body = resp.json() if resp.content else {}
+        logger.error("ig_exchange_token retornou %d: %s", resp.status_code, body)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Erro ao converter pra long-lived token: {body}",
+        )
+    payload = resp.json()
+    long_token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in") or 0)
+    if not long_token:
+        raise HTTPException(status_code=400, detail="Resposta sem long-lived token")
+    return long_token, expires_in
+
+
+async def _fetch_instagram_profile(
+    client: httpx.AsyncClient,
+    long_token: str,
+) -> dict:
+    """GET graph.instagram.com/v20.0/me — busca id, username, account_type, etc."""
+    resp = await client.get(
+        INSTAGRAM_GRAPH_ME_URL,
+        params={
+            "fields": "id,username,account_type,followers_count,media_count",
+            "access_token": long_token,
+        },
+    )
+    if resp.status_code != 200:
+        body = resp.json() if resp.content else {}
+        logger.error("/me retornou %d: %s", resp.status_code, body)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Erro ao buscar perfil Instagram: {body}",
+        )
+    return resp.json()
+
+
+def _build_response_from_doc(data: dict, *, message: str) -> InstagramCallbackResponse:
+    accounts_data = data.get("instagram_accounts", [])
+    accounts = [
+        InstagramAccount(
+            id=acc.get("id", ""),
+            username=acc.get("username"),
+            name=acc.get("name") or acc.get("username"),
+        )
+        for acc in accounts_data
+    ]
+    return InstagramCallbackResponse(
+        api_key=data.get("api_key", ""),
+        instagram_accounts=accounts,
+        message=message,
+        status="success",
+    )
+
+
+def _dt_module():
+    """Import lazy de datetime — evita warning de Pyright sobre uso top-level."""
+    import datetime as _dt
+    return _dt
