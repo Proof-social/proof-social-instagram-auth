@@ -107,7 +107,10 @@ async def instagram_login(
         }
         auth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
 
-        logger.info("Instagram OAuth URL gerada user_uid=%s", user_uid)
+        logger.info(
+            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s",
+            user_uid, request.redirect_uri,
+        )
         return InstagramLoginResponse(auth_url=auth_url)
     except HTTPException:
         raise
