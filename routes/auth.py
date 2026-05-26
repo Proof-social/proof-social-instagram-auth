@@ -141,20 +141,6 @@ async def instagram_process_callback(
     integration_ref = db.collection("integrations").document(user_uid)
     existing = integration_ref.get()
 
-    # Idempotência: se já existe integração criada há < 5min, retorna a anterior
-    # (proteção contra React Strict Mode chamando duas vezes em dev).
-    if existing.exists:
-        data = existing.to_dict() or {}
-        created_at = data.get("created_at")
-        if isinstance(created_at, _dt_module().datetime):
-            age = (_dt_module().datetime.now(_dt_module().timezone.utc) - created_at).total_seconds()
-            if age < 300:
-                logger.info(
-                    "Integration existente há %.0fs — retornando dados (dedupe Strict Mode)",
-                    age,
-                )
-                return _build_response_from_doc(data, message="Integração já configurada.")
-
     config = get_instagram_config()
     app_id = config["app_id"]
     app_secret = config["app_secret"]
@@ -173,47 +159,107 @@ async def instagram_process_callback(
 
             profile = await _fetch_instagram_profile(client, long_token)
 
+        new_account_id = str(profile.get("id") or ig_user_id)
+        new_account_username = profile.get("username") or ""
+
+        # Idempotência: se já existe doc COM ESSA MESMA conta criada há < 5min,
+        # retorna sem fazer nada. Proteção contra React Strict Mode em dev OU
+        # double-click no botão. Não atrapalha multi-conta porque compara id.
+        if existing.exists:
+            data = existing.to_dict() or {}
+            created_at = data.get("created_at")
+            already_has_this = any(
+                str(a.get("id")) == new_account_id
+                for a in (data.get("instagram_accounts") or [])
+            )
+            if (
+                already_has_this
+                and isinstance(created_at, _dt_module().datetime)
+                and (_dt_module().datetime.now(_dt_module().timezone.utc) - created_at).total_seconds() < 300
+            ):
+                logger.info(
+                    "Reconexão dedupe user_uid=%s ig_id=%s — retornando estado atual",
+                    user_uid, new_account_id,
+                )
+                return _build_response_from_doc(data, message="Integração já configurada.")
+
         api_key = str(uuid.uuid4())
         await save_access_token(api_key, long_token)
 
-        # Persiste a integration. Esquema mantém `instagram_accounts` como array
-        # de 1 elemento (Instagram Login API autoriza 1 conta por vez).
-        # Pra adicionar outra conta, user faz OAuth de novo (sobrescreve).
-        account = InstagramAccount(
-            id=str(profile.get("id") or ig_user_id),
-            username=profile.get("username"),
-            name=profile.get("username"),  # IG Login API não devolve "name" separado
-        )
-
-        integration_ref.set({
-            "user_uid": user_uid,
-            "platform": "instagram",
-            "auth_provider": "instagram_login_api",  # marker pra diferenciar do legado FB
+        # Monta o objeto da nova conta a partir do profile do IG.
+        new_account_doc = {
+            "id": new_account_id,
+            "username": new_account_username,
+            "name": profile.get("name") or new_account_username or "",
+            "account_type": profile.get("account_type", "BUSINESS"),
+            "followers_count": profile.get("followers_count", 0),
+            "media_count": profile.get("media_count", 0),
+            "profile_picture_url": profile.get("profile_picture_url") or "",
+            "active": True,
+            # Token por conta: cada conta IG tem seu próprio long-lived token.
+            # api_key aponta pra esse token específico em secret/storage.
             "api_key": api_key,
-            "status": "active",
-            "created_at": firestore.SERVER_TIMESTAMP,
-            "instagram_accounts": [
-                {
-                    "id": account.id,
-                    "username": account.username or "",
-                    "name": profile.get("name") or account.username or "",
-                    "account_type": profile.get("account_type", "BUSINESS"),
-                    "followers_count": profile.get("followers_count", 0),
-                    "media_count": profile.get("media_count", 0),
-                    "profile_picture_url": profile.get("profile_picture_url") or "",
-                }
-            ],
             "token_expires_in_seconds": expires_in,
-        })
+        }
 
-        logger.info(
-            "Instagram integration configurada user_uid=%s ig_id=%s @%s",
-            user_uid, account.id, account.username,
+        # MERGE: se já existe doc, preserva as outras contas. Adiciona/atualiza
+        # a conta nova pelo id. Caso seja primeira conexão, cria do zero.
+        if existing.exists:
+            data = existing.to_dict() or {}
+            existing_accounts = data.get("instagram_accounts") or []
+            # Substitui se já existe (refresh de token), senão append.
+            merged = [a for a in existing_accounts if str(a.get("id")) != new_account_id]
+            merged.append(new_account_doc)
+
+            integration_ref.update({
+                "instagram_accounts": merged,
+                # api_key root do doc fica apontando pra última conta conectada
+                # (compat com código legado que lê integration.api_key direto).
+                # Code novo deve preferir account.api_key.
+                "api_key": api_key,
+                "status": "active",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "token_expires_in_seconds": expires_in,
+            })
+            logger.info(
+                "Instagram account adicionada (merge) user_uid=%s ig_id=%s @%s total_accounts=%d",
+                user_uid, new_account_id, new_account_username, len(merged),
+            )
+        else:
+            integration_ref.set({
+                "user_uid": user_uid,
+                "platform": "instagram",
+                "auth_provider": "instagram_login_api",
+                "api_key": api_key,
+                "status": "active",
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "instagram_accounts": [new_account_doc],
+                "token_expires_in_seconds": expires_in,
+            })
+            logger.info(
+                "Instagram integration criada user_uid=%s ig_id=%s @%s",
+                user_uid, new_account_id, new_account_username,
+            )
+
+        account = InstagramAccount(
+            id=new_account_id,
+            username=new_account_username,
+            name=new_account_username,
         )
-
+        # Refetch pra incluir TODAS as contas no response (importante pro
+        # frontend atualizar a lista no appState).
+        final = integration_ref.get().to_dict() or {}
+        all_accounts = [
+            InstagramAccount(
+                id=str(a.get("id")),
+                username=a.get("username"),
+                name=a.get("name") or a.get("username"),
+            )
+            for a in (final.get("instagram_accounts") or [])
+        ]
         return InstagramCallbackResponse(
             api_key=api_key,
-            instagram_accounts=[account],
+            instagram_accounts=all_accounts or [account],
             message="Integração Instagram configurada com sucesso",
             status="success",
         )
