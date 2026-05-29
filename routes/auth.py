@@ -105,20 +105,20 @@ async def instagram_login(
             "scope": ",".join(INSTAGRAM_SCOPES),
             "state": state,
         }
-        oauth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
-
-        # Quando user quer ADICIONAR conta nova, força logout da sessão IG
-        # ativa antes de chegar no OAuth — senão Meta auto-continua com a
-        # conta logada no browser.
-        if request.force_new_account:
-            from urllib.parse import quote
-            auth_url = f"https://www.instagram.com/accounts/logout/?next={quote(oauth_url, safe='')}"
-        else:
-            auth_url = oauth_url
+        # Sempre usa o OAuth URL direto, sem prefixar logout.
+        # Por quê: o logout?next=<oauth_url> quebrava a chain quando havia
+        # verificação por email no meio. IG fazia logout, redirecionava pro
+        # OAuth, mas no meio do flow de login (verificação por email) o
+        # state do OAuth se perdia → user terminava na home do IG sem
+        # voltar pro Proof. O parâmetro `force_authentication=1` já força
+        # reentrada de credenciais; pra trocar de conta, user usa a opção
+        # "Trocar de conta" da própria tela do Meta.
+        auth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
+        _ = request.force_new_account  # mantido na request pra compat; ignorado
 
         logger.info(
-            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s force_new=%s",
-            user_uid, request.redirect_uri, request.force_new_account,
+            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s",
+            user_uid, request.redirect_uri,
         )
         return InstagramLoginResponse(auth_url=auth_url)
     except HTTPException:
