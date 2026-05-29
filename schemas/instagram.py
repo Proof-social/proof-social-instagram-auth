@@ -9,6 +9,10 @@ from typing import List, Optional
 class InstagramLoginRequest(BaseModel):
     """Request para iniciar fluxo OAuth"""
     redirect_uri: str
+    # Quando True, frontend quer FORÇAR escolha de conta nova (usuário já
+    # tem uma conta conectada e quer adicionar outra). Backend prefixa o
+    # OAuth URL com logout do IG pra não auto-continuar a sessão atual.
+    force_new_account: bool = False
 
 
 class InstagramLoginResponse(BaseModel):

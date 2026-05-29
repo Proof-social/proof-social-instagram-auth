@@ -105,11 +105,20 @@ async def instagram_login(
             "scope": ",".join(INSTAGRAM_SCOPES),
             "state": state,
         }
-        auth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
+        oauth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
+
+        # Quando user quer ADICIONAR conta nova, força logout da sessão IG
+        # ativa antes de chegar no OAuth — senão Meta auto-continua com a
+        # conta logada no browser.
+        if request.force_new_account:
+            from urllib.parse import quote
+            auth_url = f"https://www.instagram.com/accounts/logout/?next={quote(oauth_url, safe='')}"
+        else:
+            auth_url = oauth_url
 
         logger.info(
-            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s",
-            user_uid, request.redirect_uri,
+            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s force_new=%s",
+            user_uid, request.redirect_uri, request.force_new_account,
         )
         return InstagramLoginResponse(auth_url=auth_url)
     except HTTPException:
