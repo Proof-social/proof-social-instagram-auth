@@ -290,41 +290,68 @@ async def _exchange_code_for_short_token(
 ) -> tuple[str, str]:
     """POST x-www-form-urlencoded para api.instagram.com/oauth/access_token.
 
-    Retorna (short_token, ig_user_id).
+    Retorna (short_token, ig_user_id). Faz retry em erro transitório da Meta
+    (vide _is_transient_meta_error); NÃO retenta code já usado / secret errado.
     """
-    resp = await client.post(
-        INSTAGRAM_TOKEN_URL,
-        data={
-            "client_id": app_id,
-            "client_secret": app_secret,
-            "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri,
-            "code": code,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    if resp.status_code != 200:
-        body = resp.json() if resp.content else {}
-        error_msg = body.get("error_message") or body.get("error", {}).get("message", "")
-        # Code reusage: IG retorna "Authorization code has been used"
+    last_body: dict = {}
+    for attempt in range(1, _LONG_TOKEN_MAX_ATTEMPTS + 1):
+        try:
+            resp = await client.post(
+                INSTAGRAM_TOKEN_URL,
+                data={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        except httpx.RequestError as e:
+            logger.warning(
+                "code→short_token tentativa %d/%d falhou no transporte: %s",
+                attempt, _LONG_TOKEN_MAX_ATTEMPTS, e,
+            )
+            if attempt < _LONG_TOKEN_MAX_ATTEMPTS:
+                await asyncio.sleep(_LONG_TOKEN_BACKOFF_S[attempt - 1])
+                continue
+            raise HTTPException(status_code=400, detail=f"Erro de rede ao trocar code por token: {e}")
+
+        if resp.status_code == 200:
+            payload = resp.json()
+            short_token = payload.get("access_token")
+            ig_user_id = str(payload.get("user_id") or "")
+            if not short_token:
+                raise HTTPException(status_code=400, detail="Resposta sem access_token")
+            if attempt > 1:
+                logger.info("code→short_token OK na tentativa %d (erro transitório superado)", attempt)
+            return short_token, ig_user_id
+
+        last_body = resp.json() if resp.content else {}
+        error_msg = last_body.get("error_message") or last_body.get("error", {}).get("message", "")
+        # Code reusage: IG retorna "Authorization code has been used" — erro
+        # PERMANENTE, não retenta; devolve a integração existente se houver.
         if "has been used" in str(error_msg).lower() and existing_doc and existing_doc.exists:
             data = existing_doc.to_dict() or {}
             logger.warning("Código já usado; devolvendo integração existente")
             response_data = _build_response_from_doc(data, message="Integração já configurada.")
             # Lança HTTPException pra interromper o fluxo principal
             raise HTTPException(status_code=200, detail=response_data.model_dump())
-        logger.error("IG /oauth/access_token retornou %d: %s", resp.status_code, body)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Erro ao trocar code por token: {body}",
-        )
 
-    payload = resp.json()
-    short_token = payload.get("access_token")
-    ig_user_id = str(payload.get("user_id") or "")
-    if not short_token:
-        raise HTTPException(status_code=400, detail="Resposta sem access_token")
-    return short_token, ig_user_id
+        transient = _is_transient_meta_error(resp.status_code, last_body)
+        logger.error(
+            "IG /oauth/access_token retornou %d (tentativa %d/%d, transitório=%s): %s",
+            resp.status_code, attempt, _LONG_TOKEN_MAX_ATTEMPTS, transient, last_body,
+        )
+        if transient and attempt < _LONG_TOKEN_MAX_ATTEMPTS:
+            await asyncio.sleep(_LONG_TOKEN_BACKOFF_S[attempt - 1])
+            continue
+        break
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Erro ao trocar code por token: {last_body}",
+    )
 
 
 # Retry da troca short→long. O endpoint graph.instagram.com/access_token às vezes
@@ -333,6 +360,9 @@ async def _exchange_code_for_short_token(
 # requisição idêntica passa (200) segundos depois. Sem retry, o user vê
 # "Erro ao processar integração" e fica travado no signup. Confirmado em log:
 # mesma URL/método/secret deu 200 às 18:50 e 400 às 23:16 do mesmo dia.
+# O mesmo limite/backoff é reusado pelas outras duas chamadas Graph do callback
+# (_exchange_code_for_short_token e _fetch_instagram_profile), que sofrem do
+# mesmo soluço transitório.
 _LONG_TOKEN_MAX_ATTEMPTS = 3
 _LONG_TOKEN_BACKOFF_S = (0.6, 1.5)  # espera antes das tentativas 2 e 3
 
@@ -416,22 +446,51 @@ async def _fetch_instagram_profile(
     client: httpx.AsyncClient,
     long_token: str,
 ) -> dict:
-    """GET graph.instagram.com/v20.0/me — busca id, username, account_type, etc."""
-    resp = await client.get(
-        INSTAGRAM_GRAPH_ME_URL,
-        params={
-            "fields": "id,username,account_type,followers_count,media_count,profile_picture_url,name",
-            "access_token": long_token,
-        },
-    )
-    if resp.status_code != 200:
-        body = resp.json() if resp.content else {}
-        logger.error("/me retornou %d: %s", resp.status_code, body)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Erro ao buscar perfil Instagram: {body}",
+    """GET graph.instagram.com/v20.0/me — busca id, username, account_type, etc.
+
+    Faz retry em erro transitório da Meta (vide _is_transient_meta_error); NÃO
+    retenta token inválido (code 190) / permissão.
+    """
+    last_body: dict = {}
+    for attempt in range(1, _LONG_TOKEN_MAX_ATTEMPTS + 1):
+        try:
+            resp = await client.get(
+                INSTAGRAM_GRAPH_ME_URL,
+                params={
+                    "fields": "id,username,account_type,followers_count,media_count,profile_picture_url,name",
+                    "access_token": long_token,
+                },
+            )
+        except httpx.RequestError as e:
+            logger.warning(
+                "/me tentativa %d/%d falhou no transporte: %s",
+                attempt, _LONG_TOKEN_MAX_ATTEMPTS, e,
+            )
+            if attempt < _LONG_TOKEN_MAX_ATTEMPTS:
+                await asyncio.sleep(_LONG_TOKEN_BACKOFF_S[attempt - 1])
+                continue
+            raise HTTPException(status_code=400, detail=f"Erro de rede ao buscar perfil Instagram: {e}")
+
+        if resp.status_code == 200:
+            if attempt > 1:
+                logger.info("/me OK na tentativa %d (erro transitório superado)", attempt)
+            return resp.json()
+
+        last_body = resp.json() if resp.content else {}
+        transient = _is_transient_meta_error(resp.status_code, last_body)
+        logger.error(
+            "/me retornou %d (tentativa %d/%d, transitório=%s): %s",
+            resp.status_code, attempt, _LONG_TOKEN_MAX_ATTEMPTS, transient, last_body,
         )
-    return resp.json()
+        if transient and attempt < _LONG_TOKEN_MAX_ATTEMPTS:
+            await asyncio.sleep(_LONG_TOKEN_BACKOFF_S[attempt - 1])
+            continue
+        break
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Erro ao buscar perfil Instagram: {last_body}",
+    )
 
 
 def _build_response_from_doc(data: dict, *, message: str) -> InstagramCallbackResponse:
