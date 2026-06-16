@@ -327,6 +327,33 @@ async def _exchange_code_for_short_token(
     return short_token, ig_user_id
 
 
+# Retry da troca short→long. O endpoint graph.instagram.com/access_token às vezes
+# recusa a MESMA requisição GET com "Unsupported request - method type: get"
+# (IGApiException code 100) ou 5xx — glitch transitório de roteamento da Meta: a
+# requisição idêntica passa (200) segundos depois. Sem retry, o user vê
+# "Erro ao processar integração" e fica travado no signup. Confirmado em log:
+# mesma URL/método/secret deu 200 às 18:50 e 400 às 23:16 do mesmo dia.
+_LONG_TOKEN_MAX_ATTEMPTS = 3
+_LONG_TOKEN_BACKOFF_S = (0.6, 1.5)  # espera antes das tentativas 2 e 3
+
+
+def _is_transient_meta_error(status_code: int, body: dict) -> bool:
+    """True se o erro da Meta é transitório (vale retry). NÃO retenta erro
+    permanente (token inválido=190, permissão, secret errado)."""
+    if status_code >= 500:
+        return True
+    err = (body or {}).get("error") or {}
+    code = err.get("code")
+    msg = str(err.get("message") or "").lower()
+    # code 100 + "unsupported request - method type: get" = glitch de roteamento
+    if code == 100 and "unsupported request" in msg:
+        return True
+    # codes documentados como transitórios: 1 (unknown), 2 (service indisponível)
+    if code in (1, 2):
+        return True
+    return False
+
+
 async def _exchange_short_for_long_token(
     client: httpx.AsyncClient,
     app_secret: str,
@@ -334,29 +361,55 @@ async def _exchange_short_for_long_token(
 ) -> tuple[str, int]:
     """GET graph.instagram.com/access_token?grant_type=ig_exchange_token.
 
-    Retorna (long_token, expires_in_seconds).
+    Retorna (long_token, expires_in_seconds). Faz retry em erro transitório da
+    Meta (vide _is_transient_meta_error).
     """
-    resp = await client.get(
-        INSTAGRAM_GRAPH_LONG_TOKEN_URL,
-        params={
-            "grant_type": "ig_exchange_token",
-            "client_secret": app_secret,
-            "access_token": short_token,
-        },
-    )
-    if resp.status_code != 200:
-        body = resp.json() if resp.content else {}
-        logger.error("ig_exchange_token retornou %d: %s", resp.status_code, body)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Erro ao converter pra long-lived token: {body}",
+    last_body: dict = {}
+    for attempt in range(1, _LONG_TOKEN_MAX_ATTEMPTS + 1):
+        try:
+            resp = await client.get(
+                INSTAGRAM_GRAPH_LONG_TOKEN_URL,
+                params={
+                    "grant_type": "ig_exchange_token",
+                    "client_secret": app_secret,
+                    "access_token": short_token,
+                },
+            )
+        except httpx.RequestError as e:
+            logger.warning(
+                "ig_exchange_token tentativa %d/%d falhou no transporte: %s",
+                attempt, _LONG_TOKEN_MAX_ATTEMPTS, e,
+            )
+            if attempt < _LONG_TOKEN_MAX_ATTEMPTS:
+                await asyncio.sleep(_LONG_TOKEN_BACKOFF_S[attempt - 1])
+                continue
+            raise HTTPException(status_code=400, detail=f"Erro de rede ao converter token: {e}")
+
+        if resp.status_code == 200:
+            payload = resp.json()
+            long_token = payload.get("access_token")
+            expires_in = int(payload.get("expires_in") or 0)
+            if not long_token:
+                raise HTTPException(status_code=400, detail="Resposta sem long-lived token")
+            if attempt > 1:
+                logger.info("ig_exchange_token OK na tentativa %d (erro transitório superado)", attempt)
+            return long_token, expires_in
+
+        last_body = resp.json() if resp.content else {}
+        transient = _is_transient_meta_error(resp.status_code, last_body)
+        logger.error(
+            "ig_exchange_token retornou %d (tentativa %d/%d, transitório=%s): %s",
+            resp.status_code, attempt, _LONG_TOKEN_MAX_ATTEMPTS, transient, last_body,
         )
-    payload = resp.json()
-    long_token = payload.get("access_token")
-    expires_in = int(payload.get("expires_in") or 0)
-    if not long_token:
-        raise HTTPException(status_code=400, detail="Resposta sem long-lived token")
-    return long_token, expires_in
+        if transient and attempt < _LONG_TOKEN_MAX_ATTEMPTS:
+            await asyncio.sleep(_LONG_TOKEN_BACKOFF_S[attempt - 1])
+            continue
+        break
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Erro ao converter pra long-lived token: {last_body}",
+    )
 
 
 async def _fetch_instagram_profile(
