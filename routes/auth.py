@@ -360,8 +360,14 @@ async def _exchange_code_for_short_token(
             ig_user_id = str(payload.get("user_id") or "")
             if not short_token:
                 raise HTTPException(status_code=400, detail="Resposta sem access_token")
-            if attempt > 1:
-                logger.info("code→short_token OK na tentativa %d (erro transitório superado)", attempt)
+            # Diagnóstico: QUAL conta IG autorizou (ig_user_id/IGSID) + escopos concedidos.
+            # Se graph.instagram.com depois rejeitar o token ("Unsupported request"), isto
+            # revela se autorizou a conta ERRADA (navegador logado em outra) ou se faltou
+            # escopo — sem depender do /me (que falha p/ token inelegível).
+            logger.info(
+                "code→short OK (try %d): ig_user_id=%s permissions=%s",
+                attempt, ig_user_id, payload.get("permissions"),
+            )
             return short_token, ig_user_id
 
         last_body = resp.json() if resp.content else {}
