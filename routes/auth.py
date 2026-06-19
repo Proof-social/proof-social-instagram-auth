@@ -162,9 +162,37 @@ async def instagram_process_callback(
                 existing_doc=existing,
             )
 
-            long_token, expires_in = await _exchange_short_for_long_token(
-                client, app_secret, short_token,
-            )
+            try:
+                long_token, expires_in = await _exchange_short_for_long_token(
+                    client, app_secret, short_token,
+                )
+            except HTTPException as exch_err:
+                # short→long falhou. Diagnóstico: o short token É válido pra /me,
+                # então descobrimos QUE conta é. A troca long-lived da Instagram API
+                # só funciona pra conta PROFISSIONAL (Comercial/Criador) — conta
+                # Pessoal devolve "Unsupported request - method type: get" (críptico).
+                acc_type, uname = "", ""
+                try:
+                    diag = await _fetch_instagram_profile(client, short_token)
+                    acc_type = str(diag.get("account_type") or "").upper()
+                    uname = diag.get("username") or ""
+                except Exception as diag_err:
+                    logger.warning("diagnóstico account_type falhou user_uid=%s: %s", user_uid, diag_err)
+                logger.error(
+                    "short→long FALHOU user_uid=%s conta=@%s account_type=%s :: %s",
+                    user_uid, uname or "?", acc_type or "DESCONHECIDO", exch_err.detail,
+                )
+                if acc_type and acc_type not in ("BUSINESS", "MEDIA_CREATOR", "CREATOR"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"A conta @{uname} é do tipo '{acc_type}'. O Instagram só permite "
+                            "conectar contas Profissionais (Comercial ou Criador de conteúdo). "
+                            "Converta a conta nas configurações do Instagram (Configurações → "
+                            "Tipo de conta) e tente novamente."
+                        ),
+                    )
+                raise exch_err
 
             profile = await _fetch_instagram_profile(client, long_token)
 
