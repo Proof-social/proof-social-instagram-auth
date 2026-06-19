@@ -167,29 +167,38 @@ async def instagram_process_callback(
                     client, app_secret, short_token,
                 )
             except HTTPException as exch_err:
-                # short→long falhou. Diagnóstico: o short token É válido pra /me,
-                # então descobrimos QUE conta é. A troca long-lived da Instagram API
-                # só funciona pra conta PROFISSIONAL (Comercial/Criador) — conta
-                # Pessoal devolve "Unsupported request - method type: get" (críptico).
-                acc_type, uname = "", ""
+                # "Unsupported request - method type: get" (code 100) na troca long-lived
+                # NÃO é transitório: é a assinatura de conta NÃO-ELEGÍVEL. O token devolvido
+                # não é um token da Instagram Graph API — o próprio graph.instagram.com
+                # rejeita QUALQUER GET com ele (inclusive /me), então nem dá pra ler o
+                # account_type. Acontece quando a conta IG não é Profissional (Comercial/
+                # Criador). Detectamos pela assinatura do erro e damos mensagem acionável.
+                detail_str = str(exch_err.detail or "")
+                inelegivel = (
+                    "unsupported request" in detail_str.lower()
+                    or "method type: get" in detail_str.lower()
+                )
+                # Best-effort: tenta o username/tipo (geralmente também falha p/ conta inelegível).
+                uname, acc_type = "", ""
                 try:
                     diag = await _fetch_instagram_profile(client, short_token)
-                    acc_type = str(diag.get("account_type") or "").upper()
                     uname = diag.get("username") or ""
-                except Exception as diag_err:
-                    logger.warning("diagnóstico account_type falhou user_uid=%s: %s", user_uid, diag_err)
+                    acc_type = str(diag.get("account_type") or "").upper()
+                except Exception:
+                    pass
                 logger.error(
-                    "short→long FALHOU user_uid=%s conta=@%s account_type=%s :: %s",
-                    user_uid, uname or "?", acc_type or "DESCONHECIDO", exch_err.detail,
+                    "short→long FALHOU user_uid=%s conta=@%s account_type=%s inelegivel=%s :: %s",
+                    user_uid, uname or "?", acc_type or "DESCONHECIDO", inelegivel, detail_str,
                 )
-                if acc_type and acc_type not in ("BUSINESS", "MEDIA_CREATOR", "CREATOR"):
+                if inelegivel or (acc_type and acc_type not in ("BUSINESS", "MEDIA_CREATOR", "CREATOR")):
+                    conta = f"@{uname} " if uname else ""
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            f"A conta @{uname} é do tipo '{acc_type}'. O Instagram só permite "
-                            "conectar contas Profissionais (Comercial ou Criador de conteúdo). "
-                            "Converta a conta nas configurações do Instagram (Configurações → "
-                            "Tipo de conta) e tente novamente."
+                            f"Não foi possível conectar a conta {conta}do Instagram. Em geral isso "
+                            "acontece quando ela NÃO é uma conta Profissional. No app do Instagram: "
+                            "Configurações → Tipo e ferramentas de conta → mude para Profissional "
+                            "(Comercial ou Criador de conteúdo) e tente conectar de novo."
                         ),
                     )
                 raise exch_err
