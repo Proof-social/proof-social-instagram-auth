@@ -167,18 +167,29 @@ async def instagram_process_callback(
                     client, app_secret, short_token,
                 )
             except HTTPException as exch_err:
-                # "Unsupported request - method type: get" (code 100) na troca long-lived
-                # NÃO é transitório: é a assinatura de conta NÃO-ELEGÍVEL. O token devolvido
-                # não é um token da Instagram Graph API — o próprio graph.instagram.com
-                # rejeita QUALQUER GET com ele (inclusive /me), então nem dá pra ler o
-                # account_type. Acontece quando a conta IG não é Profissional (Comercial/
-                # Criador). Detectamos pela assinatura do erro e damos mensagem acionável.
+                # "Unsupported request - method type: get" (code 100) na troca long-lived.
+                #
+                # DIAGNÓSTICO 2026-07-08: para contas de TERCEIROS, a causa real desse erro
+                # é que as permissões instagram_business_* do app Meta estão em Standard
+                # Access ("Pronto para teste"), não Advanced Access. Em Standard Access só
+                # contas com papel no app (admin/dev/Instagram Tester) conseguem usar o
+                # token; qualquer cliente externo autoriza (code→short OK) mas o token nasce
+                # inerte no graph.instagram.com e QUALQUER GET com ele (inclusive /me) é
+                # rejeitado. Ou seja: o cliente PODE já ser Profissional e mesmo assim
+                # falhar. NÃO classifique este erro como "conta pessoal/inelegível".
+                #
+                # TENSÃO com _is_transient_meta_error: aquela função trata o MESMO erro
+                # (code 100 + "unsupported request") como transitório e faz retry, na
+                # hipótese de glitch de roteamento da Meta. O retry é mantido de propósito;
+                # se ele esgotar e cairmos aqui, o cenário provável é falta de Advanced
+                # Access, não conta pessoal. As duas hipóteses convivem — não removê-las.
                 detail_str = str(exch_err.detail or "")
-                inelegivel = (
+                app_sem_advanced_access = (
                     "unsupported request" in detail_str.lower()
                     or "method type: get" in detail_str.lower()
                 )
-                # Best-effort: tenta o username/tipo (geralmente também falha p/ conta inelegível).
+                # Best-effort: tenta ler username/tipo (geralmente também falha aqui).
+                # account_type só distingue conta pessoal DE FATO — e não é o caso comum.
                 uname, acc_type = "", ""
                 try:
                     diag = await _fetch_instagram_profile(client, short_token)
@@ -186,19 +197,23 @@ async def instagram_process_callback(
                     acc_type = str(diag.get("account_type") or "").upper()
                 except Exception:
                     pass
-                logger.error(
-                    "short→long FALHOU user_uid=%s conta=@%s account_type=%s inelegivel=%s :: %s",
-                    user_uid, uname or "?", acc_type or "DESCONHECIDO", inelegivel, detail_str,
+                conta_pessoal = bool(acc_type) and acc_type not in (
+                    "BUSINESS", "MEDIA_CREATOR", "CREATOR",
                 )
-                if inelegivel or (acc_type and acc_type not in ("BUSINESS", "MEDIA_CREATOR", "CREATOR")):
-                    conta = f"@{uname} " if uname else ""
+                logger.error(
+                    "short→long FALHOU user_uid=%s conta=@%s account_type=%s "
+                    "app_sem_advanced_access=%s conta_pessoal=%s :: %s",
+                    user_uid, uname or "?", acc_type or "DESCONHECIDO",
+                    app_sem_advanced_access, conta_pessoal, detail_str,
+                )
+                if app_sem_advanced_access or conta_pessoal:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            f"Não foi possível conectar a conta {conta}do Instagram. Em geral isso "
-                            "acontece quando ela NÃO é uma conta Profissional. No app do Instagram: "
-                            "Configurações → Tipo e ferramentas de conta → mude para Profissional "
-                            "(Comercial ou Criador de conteúdo) e tente conectar de novo."
+                            "Não foi possível conectar sua conta do Instagram agora. Isso "
+                            "pode acontecer enquanto nosso acesso à API do Instagram está em "
+                            "processo de liberação junto à Meta. Já estamos cuidando disso — "
+                            "tente novamente mais tarde ou fale com o suporte."
                         ),
                     )
                 raise exch_err
