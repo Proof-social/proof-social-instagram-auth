@@ -9,9 +9,14 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from core.log_redaction import install_log_redaction
 from routes import auth
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Rediga secrets/tokens dos logs e silencia o request-line do httpx (que emitia
+# client_secret e access_token na URL). Precisa rodar após basicConfig, para que
+# o handler do root já exista quando instalarmos o filtro.
+install_log_redaction()
 logger = logging.getLogger(__name__)
 
 
