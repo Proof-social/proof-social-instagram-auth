@@ -41,3 +41,8 @@ steps:
 
 images:
   - 'gcr.io/$PROJECT_ID/proof-social-instagram-auth'
+
+# Trigger 2nd-gen usa service_account → exige opção de logging explícita, senão o build falha
+# na validação (mesma config do proof-app). Foi por isso que o deploy do auth parou desde ago/2026.
+options:
+  logging: CLOUD_LOGGING_ONLY
