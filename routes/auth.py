@@ -28,6 +28,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from google.cloud import firestore
 
+from core import tenancy
 from core.instagram_config import get_instagram_config
 from core.security import save_access_token, verify_firebase_token
 from core.state import generate_state, validate_state, InvalidStateError
@@ -222,6 +223,33 @@ async def instagram_process_callback(
 
         new_account_id = str(profile.get("id") or ig_user_id)
         new_account_username = profile.get("username") or ""
+
+        # Portão multi-tenant (WS2): a conta só pode pertencer a UMA agência (unicidade
+        # global) e o plano tem teto de contas. Roda ANTES de gravar token/conta — se
+        # recusar, nada é persistido. Reconexão da própria conta é no-op (segue o refresh).
+        try:
+            tenancy.claim_account_for_uid(db, user_uid, new_account_id)
+        except tenancy.AccountAlreadyClaimed:
+            logger.warning(
+                "conexão recusada (conta já é de outra agência) user_uid=%s ig_id=%s",
+                user_uid, new_account_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Essa conta do Instagram já é gerenciada por outra conta Proof.",
+            )
+        except tenancy.PlanLimitReached as e:
+            logger.warning(
+                "conexão recusada (teto de plano) user_uid=%s ig_id=%s teto=%s",
+                user_uid, new_account_id, e,
+            )
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Você atingiu o limite de contas do seu plano. "
+                    "Faça upgrade para conectar mais contas."
+                ),
+            )
 
         # Idempotência: se já existe doc COM ESSA MESMA conta criada há < 5min,
         # retorna sem fazer nada. Proteção contra React Strict Mode em dev OU
