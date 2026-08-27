@@ -19,6 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
+import time
 import uuid
 from collections import defaultdict
 from typing import Optional
@@ -26,6 +29,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
 from google.cloud import firestore
 
 from core import tenancy
@@ -64,6 +68,26 @@ INSTAGRAM_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
 INSTAGRAM_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
 INSTAGRAM_GRAPH_LONG_TOKEN_URL = "https://graph.instagram.com/access_token"
 INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v20.0/me"
+
+# --- Encurtador de link de conexão (modo agência) ---
+# O auth_url do OAuth é gigante (state + scopes) e não dá pra mandar pro cliente. Guardamos ele em
+# pp_connect_links/{code} e servimos /auth/c/{code} → 302 pro auth_url. TTL = o do state link (7d).
+CONNECT_LINKS_COLLECTION = "pp_connect_links"
+AUTH_PUBLIC_URL = os.getenv(
+    "AUTH_PUBLIC_URL",
+    "https://proof-social-instagram-auth-200656387414.us-central1.run.app",
+).rstrip("/")
+
+
+def _create_short_connect_link(auth_url: str) -> str:
+    """Guarda o auth_url e devolve um link curto (/auth/c/{code}) pra agência mandar pro cliente."""
+    code = secrets.token_urlsafe(6)  # ~8 chars, URL-safe
+    firestore.Client().collection(CONNECT_LINKS_COLLECTION).document(code).set({
+        "auth_url": auth_url,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": int(time.time()) + STATE_LINK_TTL_SECONDS,
+    })
+    return f"{AUTH_PUBLIC_URL}/auth/c/{code}"
 
 
 async def get_user_uid(authorization: Optional[str] = Header(None)) -> str:
@@ -129,6 +153,10 @@ async def instagram_login(
         auth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
         _ = request.force_new_account  # mantido na request pra compat; ignorado
 
+        # Modo link (agência): o auth_url é gigante — encurta num link curto pra mandar pro cliente.
+        if request.link_mode:
+            auth_url = _create_short_connect_link(auth_url)
+
         logger.info(
             "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s",
             user_uid, request.redirect_uri,
@@ -139,6 +167,23 @@ async def instagram_login(
     except Exception as e:
         logger.error("Erro ao gerar URL Instagram OAuth: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erro: {str(e)}")
+
+
+@router.get("/c/{code}")
+async def resolve_connect_link(code: str):
+    """Resolve o link curto do modo agência → 302 pro OAuth do Instagram. Página amigável se
+    inválido/expirado. Sem auth: é um link público que a agência manda pro cliente."""
+    snap = firestore.Client().collection(CONNECT_LINKS_COLLECTION).document(code).get()
+    data = snap.to_dict() if snap.exists else None
+    if not data or int(time.time()) > int(data.get("expires_at", 0)):
+        return HTMLResponse(
+            "<html><head><meta charset='utf-8'></head>"
+            "<body style='font-family:system-ui;text-align:center;padding:64px;color:#425466'>"
+            "<h2 style='color:#121E66'>Link inválido ou expirado</h2>"
+            "<p>Peça um novo link de conexão para a agência.</p></body></html>",
+            status_code=410,
+        )
+    return RedirectResponse(data["auth_url"], status_code=302)
 
 
 @router.post("/instagram/process-callback", response_model=InstagramCallbackResponse)
