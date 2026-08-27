@@ -13,6 +13,9 @@ class InstagramLoginRequest(BaseModel):
     # tem uma conta conectada e quer adicionar outra). Backend prefixa o
     # OAuth URL com logout do IG pra não auto-continuar a sessão atual.
     force_new_account: bool = False
+    # Modo "link": a agência gera o link e MANDA pro cliente conectar a conta dele.
+    # O state nasce com mode="link" + TTL longo; o callback aceita sem bearer (uid vem do state).
+    link_mode: bool = False
 
 
 class InstagramLoginResponse(BaseModel):

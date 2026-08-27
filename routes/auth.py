@@ -31,7 +31,7 @@ from google.cloud import firestore
 from core import tenancy
 from core.instagram_config import get_instagram_config
 from core.security import save_access_token, verify_firebase_token
-from core.state import generate_state, validate_state, InvalidStateError
+from core.state import generate_state, validate_state, InvalidStateError, STATE_LINK_TTL_SECONDS
 from schemas.instagram import (
     InstagramAccount,
     InstagramCallbackRequest,
@@ -76,6 +76,18 @@ async def get_user_uid(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail=f"Token inválido: {e}")
 
 
+async def get_user_uid_optional(authorization: Optional[str] = Header(None)) -> Optional[str]:
+    """Como get_user_uid, mas retorna None se NÃO houver token (em vez de 401). Usado no
+    callback: o fluxo logado manda o bearer; o fluxo link (cliente) não manda — aí o uid
+    vem do state assinado. Se vier um token, ele TEM que ser válido (senão 401)."""
+    if not authorization:
+        return None
+    try:
+        return await verify_firebase_token(authorization)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Token inválido: {e}")
+
+
 @router.post("/instagram/login", response_model=InstagramLoginResponse)
 async def instagram_login(
     request: InstagramLoginRequest,
@@ -89,7 +101,7 @@ async def instagram_login(
     try:
         config = get_instagram_config()
         try:
-            state = generate_state(user_uid)
+            state = generate_state(user_uid, mode="link" if request.link_mode else "login")
         except Exception as e:
             logger.error("Falha ao gerar state OAuth: %s", e)
             raise HTTPException(
@@ -132,9 +144,16 @@ async def instagram_login(
 @router.post("/instagram/process-callback", response_model=InstagramCallbackResponse)
 async def instagram_process_callback(
     request: InstagramCallbackRequest,
-    user_uid: str = Depends(get_user_uid),
+    user_uid_opt: Optional[str] = Depends(get_user_uid_optional),
 ):
     """Processa callback OAuth Instagram Login API e configura integração.
+
+    Dois modos:
+    - Logado (bearer presente): o usuário conecta a PRÓPRIA conta. uid vem do bearer e o state
+      precisa bater com ele (TTL curto).
+    - Link (sem bearer): a agência gerou o link e mandou pro cliente. O cliente abre e conecta a
+      conta dele sem estar logado no Proof; o uid vem do state assinado (mode="link", TTL longo).
+      O portão de unicidade (WS2) garante que a conta cai na agência certa e não é sequestrada.
 
     Body: {"code": "...", "state": "...", "redirect_uri": "..."}
     """
@@ -142,9 +161,16 @@ async def instagram_process_callback(
     cleaned_state = (request.state or "").split("#")[0].rstrip("_=").strip()
 
     try:
-        validate_state(state=cleaned_state, user_uid=user_uid)
+        if user_uid_opt:
+            user_uid = validate_state(state=cleaned_state, user_uid=user_uid_opt)
+        else:
+            user_uid = validate_state(
+                state=cleaned_state,
+                expected_mode="link",
+                ttl_seconds=STATE_LINK_TTL_SECONDS,
+            )
     except InvalidStateError as e:
-        logger.warning("OAuth state inválido user_uid=%s reason=%s", user_uid, e)
+        logger.warning("OAuth state inválido reason=%s", e)
         raise HTTPException(status_code=400, detail=f"State inválido ou expirado: {e}")
 
     db = firestore.Client()
