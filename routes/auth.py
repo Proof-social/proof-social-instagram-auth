@@ -46,17 +46,17 @@ router = APIRouter()
 # Lock por código pra evitar processar o mesmo code 2x (React Strict Mode).
 processing_codes: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-# Scopes do Instagram Login API. Cobertura para o que o Proof precisa:
-# - basic: id, username, account_type
-# - manage_insights: profile + media insights
-# - manage_comments: ler/responder comments
-# - manage_messages: DMs (futuro)
-# - content_publish: publish (futuro, exige App Review)
+# Scopes do Instagram Login API. SÓ o que o Proof usa de fato — pedir permissão não-usada
+# é motivo comum de reprovação no App Review (e manage_messages é a mais escrutinada da Meta).
+# - basic: id, username, account_type, /media, /me
+# - manage_insights: profile + media insights (/insights)
+# - content_publish: agendar/publicar post e story (fila instagram-publish)
+# manage_comments e manage_messages REMOVIDOS (não usados; ler comment é só a métrica de
+# contagem, via basic/insights). Se um dia entrar automação de DM/comentário, re-adicionar
+# aqui + App Review próprio pra essas permissões.
 INSTAGRAM_SCOPES = [
     "instagram_business_basic",
     "instagram_business_manage_insights",
-    "instagram_business_manage_comments",
-    "instagram_business_manage_messages",
     "instagram_business_content_publish",
 ]
 
