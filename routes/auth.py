@@ -278,15 +278,35 @@ async def instagram_process_callback(
                     user_uid, uname or "?", acc_type or "DESCONHECIDO",
                     app_sem_advanced_access, conta_pessoal, detail_str,
                 )
-                if app_sem_advanced_access or conta_pessoal:
+                if conta_pessoal:
+                    # Sinal DEFINITIVO de conta pessoal — é o único caso que o PRÓPRIO usuário
+                    # resolve. Mensagem acionável (não "tente mais tarde").
                     raise HTTPException(
                         status_code=400,
-                        detail=(
-                            "Não foi possível conectar sua conta do Instagram agora. Isso "
-                            "pode acontecer enquanto nosso acesso à API do Instagram está em "
-                            "processo de liberação junto à Meta. Já estamos cuidando disso — "
-                            "tente novamente mais tarde ou fale com o suporte."
-                        ),
+                        detail={
+                            "code": "personal_account",
+                            "message": (
+                                "Sua conta do Instagram precisa ser Profissional (Business ou "
+                                "Criador). No app do Instagram: Configurações → Tipo de conta e "
+                                "ferramentas → Mudar para conta profissional. Depois volte e tente "
+                                "conectar de novo."
+                            ),
+                        },
+                    )
+                if app_sem_advanced_access:
+                    # Standard Access (App Review pendente) — pendência NOSSA. Uma conta profissional
+                    # pode falhar aqui; NÃO classificar como conta pessoal (ver comentário acima).
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "code": "app_access_pending",
+                            "message": (
+                                "Ainda não conseguimos conectar contas externas — nosso acesso à API "
+                                "do Instagram está em liberação junto à Meta. Se você é testador, "
+                                "confirme que foi adicionado como tester no app; senão, tente mais "
+                                "tarde ou fale com o suporte."
+                            ),
+                        },
                     )
                 raise exch_err
 
@@ -307,7 +327,14 @@ async def instagram_process_callback(
             )
             raise HTTPException(
                 status_code=409,
-                detail="Essa conta do Instagram já é gerenciada por outra conta Proof.",
+                detail={
+                    "code": "account_already_claimed",
+                    "message": (
+                        "Essa conta do Instagram já está conectada a outra conta Proof. Se ela é "
+                        "sua, desconecte na outra conta primeiro; se acha que é engano, fale com o "
+                        "suporte."
+                    ),
+                },
             )
         except tenancy.PlanLimitReached as e:
             logger.warning(
@@ -316,10 +343,13 @@ async def instagram_process_callback(
             )
             raise HTTPException(
                 status_code=402,
-                detail=(
-                    "Você atingiu o limite de contas do seu plano. "
-                    "Faça upgrade para conectar mais contas."
-                ),
+                detail={
+                    "code": "plan_limit",
+                    "message": (
+                        "Você atingiu o limite de contas do seu plano. Faça upgrade em "
+                        "Configurações → Assinatura para conectar mais contas."
+                    ),
+                },
             )
 
         # Idempotência: se já existe doc COM ESSA MESMA conta criada há < 5min,
