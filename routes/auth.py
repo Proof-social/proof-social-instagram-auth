@@ -331,15 +331,20 @@ async def instagram_process_callback(
     # Limpa fragmento `#_=_` que Meta às vezes adiciona.
     cleaned_state = (request.state or "").split("#")[0].rstrip("_=").strip()
 
+    # O FLUXO é decidido pelo `mode` ASSINADO do state, NÃO pela presença do bearer:
+    #  - "link" (convite de agência): a conta conectada vai pra AGÊNCIA (uid do state), independe de
+    #    quem clica — mesmo que a pessoa esteja logada no Proof com OUTRA conta. (Antes, um cliente
+    #    logado caía no ramo "login" e era rejeitado com "state pertence a outro usuário" → "link expirado".)
+    #  - "login": o usuário conecta a PRÓPRIA conta → exige bearer e que o uid do state bata (TTL curto, anti-CSRF).
     try:
-        if user_uid_opt:
-            st = validate_state(state=cleaned_state, user_uid=user_uid_opt)
+        probe = validate_state(state=cleaned_state, ttl_seconds=STATE_LINK_TTL_SECONDS)  # só lê o mode (assinado)
+        if probe.mode == "link":
+            st = validate_state(state=cleaned_state, expected_mode="link",
+                                ttl_seconds=STATE_LINK_TTL_SECONDS)
         else:
-            st = validate_state(
-                state=cleaned_state,
-                expected_mode="link",
-                ttl_seconds=STATE_LINK_TTL_SECONDS,
-            )
+            if not user_uid_opt:
+                raise HTTPException(status_code=401, detail="Autenticação necessária para conectar sua conta.")
+            st = validate_state(state=cleaned_state, user_uid=user_uid_opt)  # login: uid bate + TTL curto
     except InvalidStateError as e:
         logger.warning("OAuth state inválido reason=%s", e)
         raise HTTPException(status_code=400, detail=f"State inválido ou expirado: {e}")
