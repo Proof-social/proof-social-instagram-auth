@@ -38,6 +38,11 @@ class InstagramCallbackRequest(BaseModel):
     redirect_uri: str
 
 
+class RevokeInviteRequest(BaseModel):
+    """Request para excluir/revogar um convite de agência (tira da lista + invalida o link)."""
+    code: str
+
+
 class InstagramAccount(BaseModel):
     """Conta do Instagram"""
     id: str

@@ -42,6 +42,7 @@ from schemas.instagram import (
     InstagramCallbackResponse,
     InstagramLoginRequest,
     InstagramLoginResponse,
+    RevokeInviteRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -281,6 +282,34 @@ async def resolve_connect_link(code: str):
             status_code=410,
         )
     return RedirectResponse(data["auth_url"], status_code=302)
+
+
+@router.post("/invite/revoke")
+async def revoke_invite(
+    request: RevokeInviteRequest,
+    user_uid: str = Depends(get_user_uid),
+):
+    """Exclui um convite de agência: tira da lista (deleta pp_agency_invites/{code}) E invalida o
+    link (deleta pp_connect_links/{code} → /auth/c/{code} passa a dar 410). Só o dono (a agência que
+    criou) pode revogar."""
+    code = (request.code or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="code obrigatório")
+
+    db = firestore.Client()
+    inv_ref = db.collection(AGENCY_INVITES_COLLECTION).document(code)
+    snap = inv_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Convite não encontrado")
+    data = snap.to_dict() or {}
+    if data.get("agency_uid") != user_uid:
+        raise HTTPException(status_code=403, detail="Este convite não pertence a você")
+
+    # Invalida o link primeiro (o que o cliente abriria), depois remove o convite da lista.
+    db.collection(CONNECT_LINKS_COLLECTION).document(code).delete()
+    inv_ref.delete()
+    logger.info("convite revogado code=%s agency=%s", code, user_uid)
+    return {"status": "ok"}
 
 
 @router.post("/instagram/process-callback", response_model=InstagramCallbackResponse)
