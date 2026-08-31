@@ -20,7 +20,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Optional
+from typing import NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,17 @@ STATE_TTL_SECONDS = 600  # 10 minutos — janela típica para concluir OAuth (fl
 STATE_LINK_TTL_SECONDS = 7 * 24 * 3600  # 7 dias — modo "link" (agência gera, cliente abre depois)
 STATE_VERSION = "v1"
 VALID_MODES = ("login", "link")
+
+
+class ValidatedState(NamedTuple):
+    """Resultado de validate_state: uid do state + mode + code do convite.
+
+    `code` é o código do convite de agência (modo "link" com convite nomeado); "" quando
+    o state não carrega convite (fluxo de login, ou link antigo sem convite).
+    """
+    uid: str
+    mode: str
+    code: str
 
 
 class InvalidStateError(Exception):
@@ -59,22 +70,30 @@ def _b64decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + pad)
 
 
-def generate_state(user_uid: str, mode: str = "login") -> str:
+def generate_state(user_uid: str, mode: str = "login", code: str = "") -> str:
     """Gera state assinado para fluxo OAuth.
 
-    Formato (após base64): `v1|<uid>|<mode>|<nonce>|<ts>|<hmac>`
+    Formato (após base64): `v1|<uid>|<mode>|<code>|<nonce>|<ts>|<hmac>`
     `mode`: "login" (fluxo logado, o usuário conecta a própria conta) ou "link"
     (agência gera o link, o cliente abre e conecta a conta dele — sem estar logado no Proof).
     O mode é ASSINADO: um state de login não pode ser reusado no callback público (modo link).
+    `code`: código do convite de agência (modo "link" nomeado). "" quando não há convite.
+    O code também é ASSINADO — o cliente não pode adulterar qual convite está conectando.
+
+    Compat: states antigos (6 campos, sem code) continuam válidos em validate_state.
     """
     if not user_uid:
         raise ValueError("user_uid obrigatório")
     if mode not in VALID_MODES:
         raise ValueError(f"mode inválido: {mode!r}")
+    code = (code or "").strip()
+    if "|" in code:
+        # O separador do payload é "|"; um code com "|" quebraria o parse/HMAC.
+        raise ValueError("code não pode conter '|'")
 
     nonce = uuid.uuid4().hex
     ts = str(int(time.time()))
-    msg = f"{STATE_VERSION}|{user_uid}|{mode}|{nonce}|{ts}"
+    msg = f"{STATE_VERSION}|{user_uid}|{mode}|{code}|{nonce}|{ts}"
     sig = hmac.new(_signing_key(), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     raw = f"{msg}|{sig}"
     return _b64encode(raw.encode("utf-8"))
@@ -86,8 +105,9 @@ def validate_state(
     user_uid: Optional[str] = None,
     expected_mode: Optional[str] = None,
     ttl_seconds: int = STATE_TTL_SECONDS,
-) -> str:
-    """Valida state recebido no callback e RETORNA o uid do state. Levanta InvalidStateError.
+) -> ValidatedState:
+    """Valida state recebido no callback e RETORNA ValidatedState(uid, mode, code).
+    Levanta InvalidStateError.
 
     - Decodifica base64, confere versão, formato, HMAC.
     - `user_uid` (opcional): se dado, exige que o uid do state bata (fluxo logado). Se None,
@@ -96,7 +116,8 @@ def validate_state(
       callback público — impede reusar um state de login lá).
     - `ttl_seconds`: janela temporal.
 
-    Compat: aceita states legados de 5 partes (sem mode → tratados como "login").
+    Compat: aceita states de 7 partes (com code), 6 partes (com mode, sem code) e legados
+    de 5 partes (sem mode → tratados como "login"). code ausente → "".
     """
     if not state:
         raise InvalidStateError("state vazio")
@@ -107,12 +128,17 @@ def validate_state(
         raise InvalidStateError(f"state base64 inválido: {e}")
 
     parts = raw.split("|")
-    if len(parts) == 6:
+    if len(parts) == 7:  # v1 com code (convite de agência)
+        version, claimed_uid, mode, code, nonce, ts_str, sig = parts
+        signed_msg = f"{version}|{claimed_uid}|{mode}|{code}|{nonce}|{ts_str}"
+    elif len(parts) == 6:  # v1 com mode, sem code
         version, claimed_uid, mode, nonce, ts_str, sig = parts
+        code = ""
         signed_msg = f"{version}|{claimed_uid}|{mode}|{nonce}|{ts_str}"
     elif len(parts) == 5:  # legado (pré-mode): trata como login
         version, claimed_uid, nonce, ts_str, sig = parts
         mode = "login"
+        code = ""
         signed_msg = f"{version}|{claimed_uid}|{nonce}|{ts_str}"
     else:
         raise InvalidStateError(f"state com formato inesperado: {len(parts)} partes")
@@ -148,4 +174,4 @@ def validate_state(
     if age < 0 or age > ttl_seconds:
         raise InvalidStateError(f"state expirado (age={age}s, ttl={ttl_seconds}s)")
 
-    return claimed_uid
+    return ValidatedState(uid=claimed_uid, mode=mode, code=code)

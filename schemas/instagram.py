@@ -16,11 +16,19 @@ class InstagramLoginRequest(BaseModel):
     # Modo "link": a agência gera o link e MANDA pro cliente conectar a conta dele.
     # O state nasce com mode="link" + TTL longo; o callback aceita sem bearer (uid vem do state).
     link_mode: bool = False
+    # Convite nomeado (modalidade de agência): quando link_mode=True, a agência informa
+    # nome + email do cliente. Vira um doc em pp_agency_invites e o email é enviado pelo front.
+    # Obrigatórios se link_mode=True (validado na rota).
+    client_name: Optional[str] = None
+    client_email: Optional[str] = None
 
 
 class InstagramLoginResponse(BaseModel):
     """Response com URL de autorização"""
     auth_url: str
+    # Modo "link" com convite nomeado: o código do convite (== short-link code).
+    # O front usa pra referenciar o doc pp_agency_invites/{code}. None em fluxo de login.
+    code: Optional[str] = None
 
 
 class InstagramCallbackRequest(BaseModel):

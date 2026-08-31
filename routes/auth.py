@@ -73,21 +73,91 @@ INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v20.0/me"
 # O auth_url do OAuth é gigante (state + scopes) e não dá pra mandar pro cliente. Guardamos ele em
 # pp_connect_links/{code} e servimos /auth/c/{code} → 302 pro auth_url. TTL = o do state link (7d).
 CONNECT_LINKS_COLLECTION = "pp_connect_links"
+# Convite nomeado por cliente (modalidade de agência). Mesmo `code` do short-link liga os dois docs:
+# pp_connect_links/{code} = auth_url (interno); pp_agency_invites/{code} = metadados + status (produto).
+AGENCY_INVITES_COLLECTION = "pp_agency_invites"
 AUTH_PUBLIC_URL = os.getenv(
     "AUTH_PUBLIC_URL",
     "https://proof-social-instagram-auth-200656387414.us-central1.run.app",
 ).rstrip("/")
 
+# --- Modalidade de agência: dispara o pipeline server-side no proof-platform após a conexão ---
+# O platform orquestra catálogo → dossiê → auto-confirm → scoring. Token compartilhado
+# (== INTERNAL_SERVICE_TOKEN do platform). Sem token → o trigger é abortado (logado), não falha o OAuth.
+PLATFORM_INTERNAL_URL = os.getenv(
+    "PLATFORM_INTERNAL_URL",
+    "https://proof-platform-200656387414.us-central1.run.app",
+).rstrip("/")
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 
-def _create_short_connect_link(auth_url: str) -> str:
-    """Guarda o auth_url e devolve um link curto (/auth/c/{code}) pra agência mandar pro cliente."""
-    code = secrets.token_urlsafe(6)  # ~8 chars, URL-safe
+
+async def _trigger_agency_pipeline(agency_uid: str, ig_account_id: str, code: str) -> None:
+    """Dispara o pipeline server-side no proof-platform (modalidade de agência). Best-effort:
+    NUNCA falha o callback OAuth por causa disto (a conexão já foi persistida). Loga em erro.
+    O platform responde rápido (só marca 'processing' + enfileira), então awaitar é barato."""
+    if not INTERNAL_SERVICE_TOKEN:
+        logger.error("trigger do pipeline de agência abortado: INTERNAL_SERVICE_TOKEN vazio")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{PLATFORM_INTERNAL_URL}/internal/agency/client-connected",
+                json={"agency_uid": agency_uid, "ig_account_id": ig_account_id, "invite_code": code},
+                headers={"X-Internal-Token": INTERNAL_SERVICE_TOKEN},
+            )
+            if resp.status_code != 200:
+                logger.error("platform /internal/agency/client-connected → %s: %s",
+                             resp.status_code, resp.text[:300])
+    except Exception:
+        logger.exception("falha ao disparar pipeline de agência (agency=%s ig=%s)",
+                         agency_uid, ig_account_id)
+
+
+def _create_short_connect_link(code: str, auth_url: str) -> str:
+    """Guarda o auth_url sob {code} e devolve o link curto (/auth/c/{code}) pra agência mandar
+    pro cliente. O {code} é gerado antes do state (pra ser assinado dentro dele) e reusado aqui."""
     firestore.Client().collection(CONNECT_LINKS_COLLECTION).document(code).set({
         "auth_url": auth_url,
         "created_at": firestore.SERVER_TIMESTAMP,
         "expires_at": int(time.time()) + STATE_LINK_TTL_SECONDS,
     })
     return f"{AUTH_PUBLIC_URL}/auth/c/{code}"
+
+
+def _create_agency_invite(
+    code: str, agency_uid: str, client_name: str, client_email: str, connect_link: str,
+) -> None:
+    """Cria o doc de convite (produto). Status nasce 'pending'; o callback marca 'connected',
+    e o pipeline server-side (Fase 2) marca 'ready'. A home da agência lê isto em realtime.
+    Guarda `connect_link` (não é segredo) pra agência copiar de novo um convite pendente."""
+    firestore.Client().collection(AGENCY_INVITES_COLLECTION).document(code).set({
+        "code": code,
+        "agency_uid": agency_uid,
+        "client_name": client_name,
+        "client_email": client_email,
+        "connect_link": connect_link,
+        "status": "pending",
+        "ig_account_id": None,
+        "ig_username": None,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "connected_at": None,
+        "ready_at": None,
+        "error_motivo": None,
+    })
+
+
+def _mark_invite_connected(code: str, ig_account_id: str, ig_username: Optional[str]) -> None:
+    """Marca o convite como conectado quando o cliente conclui o OAuth. Idempotente e defensivo:
+    nunca deixa o callback falhar por causa disto (a conexão em si já foi persistida)."""
+    try:
+        firestore.Client().collection(AGENCY_INVITES_COLLECTION).document(code).set({
+            "status": "connected",
+            "ig_account_id": ig_account_id,
+            "ig_username": ig_username,
+            "connected_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        logger.error("Falha ao marcar convite %s como conectado: %s", code, e, exc_info=True)
 
 
 async def get_user_uid(authorization: Optional[str] = Header(None)) -> str:
@@ -124,8 +194,33 @@ async def instagram_login(
     """
     try:
         config = get_instagram_config()
+
+        # Convite nomeado (modalidade de agência): no modo link COM nome + email, cria um convite
+        # rastreável. Sem nome/email, o modo link continua sendo o link genérico antigo (retrocompat
+        # com o botão "Gerar link" do onboarding). Se vier só um dos dois → 400 (evita convite meia-boca).
+        # O code é gerado ANTES do state pra ser assinado dentro dele — assim o callback sabe qual
+        # convite marcar como conectado (o cliente não pode adulterá-lo).
+        invite_code: Optional[str] = None
+        client_name = (request.client_name or "").strip()
+        client_email = (request.client_email or "").strip()
+        if request.link_mode and (client_name or client_email):
+            if not client_name or not client_email:
+                raise HTTPException(
+                    status_code=400,
+                    detail="client_name e client_email são obrigatórios juntos no convite nomeado",
+                )
+            if "@" not in client_email or "." not in client_email.split("@")[-1]:
+                raise HTTPException(status_code=400, detail="client_email inválido")
+            invite_code = secrets.token_urlsafe(6)  # ~8 chars, URL-safe — id do convite E do short-link
+
         try:
-            state = generate_state(user_uid, mode="link" if request.link_mode else "login")
+            state = generate_state(
+                user_uid,
+                mode="link" if request.link_mode else "login",
+                code=invite_code or "",
+            )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error("Falha ao gerar state OAuth: %s", e)
             raise HTTPException(
@@ -153,15 +248,17 @@ async def instagram_login(
         auth_url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode(params)}"
         _ = request.force_new_account  # mantido na request pra compat; ignorado
 
-        # Modo link (agência): o auth_url é gigante — encurta num link curto pra mandar pro cliente.
-        if request.link_mode:
-            auth_url = _create_short_connect_link(auth_url)
+        # Modo link (agência): encurta o auth_url num link curto (mesmo `code` liga os dois docs)
+        # e cria o convite nomeado guardando esse link pra mandar pro cliente.
+        if request.link_mode and invite_code:
+            auth_url = _create_short_connect_link(invite_code, auth_url)
+            _create_agency_invite(invite_code, user_uid, client_name, client_email, connect_link=auth_url)
 
         logger.info(
-            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s",
-            user_uid, request.redirect_uri,
+            "Instagram OAuth URL gerada user_uid=%s redirect_uri=%s link_mode=%s",
+            user_uid, request.redirect_uri, request.link_mode,
         )
-        return InstagramLoginResponse(auth_url=auth_url)
+        return InstagramLoginResponse(auth_url=auth_url, code=invite_code)
     except HTTPException:
         raise
     except Exception as e:
@@ -207,9 +304,9 @@ async def instagram_process_callback(
 
     try:
         if user_uid_opt:
-            user_uid = validate_state(state=cleaned_state, user_uid=user_uid_opt)
+            st = validate_state(state=cleaned_state, user_uid=user_uid_opt)
         else:
-            user_uid = validate_state(
+            st = validate_state(
                 state=cleaned_state,
                 expected_mode="link",
                 ttl_seconds=STATE_LINK_TTL_SECONDS,
@@ -217,6 +314,9 @@ async def instagram_process_callback(
     except InvalidStateError as e:
         logger.warning("OAuth state inválido reason=%s", e)
         raise HTTPException(status_code=400, detail=f"State inválido ou expirado: {e}")
+
+    user_uid = st.uid
+    invite_code = st.code  # "" no fluxo de login; preenchido no convite de agência (modo link)
 
     db = firestore.Client()
     integration_ref = db.collection("integrations").document(user_uid)
@@ -447,6 +547,13 @@ async def instagram_process_callback(
             )
             for a in (final.get("instagram_accounts") or [])
         ]
+        # Convite de agência (modo link): marca o convite como conectado assim que o cliente
+        # conclui o OAuth e dispara o pipeline server-side no platform (catálogo → dossiê →
+        # auto-confirm → score). O trigger é best-effort — não falha o OAuth se o platform cair.
+        if invite_code:
+            _mark_invite_connected(invite_code, new_account_id, new_account_username or None)
+            await _trigger_agency_pipeline(user_uid, new_account_id, invite_code)
+
         return InstagramCallbackResponse(
             api_key=api_key,
             instagram_accounts=all_accounts or [account],
