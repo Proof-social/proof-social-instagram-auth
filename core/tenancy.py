@@ -133,3 +133,63 @@ def claim_account_for_uid(db: firestore.Client, uid: str, ig_account_id: str) ->
             return agency_id
         raise AccountAlreadyClaimed(acc)
     return agency_id
+
+
+def account_owner_info(db: firestore.Client, ig_account_id: str) -> dict | None:
+    """Dono atual da conta: {agency_id, connected_by_uid} ou None (não registrada)."""
+    snap = db.collection(COLLECTION_ACCOUNT_REGISTRY).document(str(ig_account_id)).get()
+    if not snap.exists:
+        return None
+    d = snap.to_dict() or {}
+    return {"agency_id": d.get("agency_id"), "connected_by_uid": d.get("connected_by_uid")}
+
+
+def agency_name(db: firestore.Client, agency_id: str | None) -> str:
+    """Nome da agência (pra mostrar 'sua conta está com a Agência X'). '' se não achar."""
+    if not agency_id:
+        return ""
+    snap = db.collection(COLLECTION_AGENCIES).document(agency_id).get()
+    return ((snap.to_dict() or {}).get("name") or "") if snap.exists else ""
+
+
+def transfer_account(db: firestore.Client, uid: str, ig_account_id: str) -> dict | None:
+    """TRANSFERE a conta pra a agência do `uid` (força), tirando-a da agência antiga (fresh start —
+    os dados derivados da antiga ficam sob o uid dela; a nova re-analisa do zero). Sobrescreve o
+    registro de posse. Retorna {old_agency_id, old_connected_by_uid} da antiga, ou None se já era
+    desta agência / não tinha dono. Respeita o teto de plano da agência NOVA."""
+    acc = str(ig_account_id)
+    if not acc:
+        raise TenancyError("ig_account_id obrigatório")
+    new_agency = get_or_create_agency(db, uid)
+    reg_ref = db.collection(COLLECTION_ACCOUNT_REGISTRY).document(acc)
+    snap = reg_ref.get()
+    old = snap.to_dict() if snap.exists else None
+    old_agency_id = (old or {}).get("agency_id")
+    old_uid = (old or {}).get("connected_by_uid")
+    if old_agency_id == new_agency:
+        return None   # já é desta agência
+    ag = db.collection(COLLECTION_AGENCIES).document(new_agency).get()
+    limit = (ag.to_dict() or {}).get("accounts_limit") if ag.exists else None
+    if limit and _count_accounts(db, new_agency) >= int(limit):
+        raise PlanLimitReached(str(limit))
+    reg_ref.set({
+        "instagram_account_id": acc, "agency_id": new_agency, "connected_by_uid": uid,
+        "connected_at": firestore.SERVER_TIMESTAMP,
+        "transferred_from": old_agency_id, "transferred_at": firestore.SERVER_TIMESTAMP,
+    })
+    return {"old_agency_id": old_agency_id, "old_connected_by_uid": old_uid} if old_agency_id else None
+
+
+def remove_account_from_integration(db: firestore.Client, old_uid: str | None, ig_account_id: str) -> None:
+    """Tira a conta IG do doc integrations/{old_uid} — a conexão saiu da agência antiga, então ela
+    deixa de listar a conta como conectada (o painel dela mostra 'desconectada')."""
+    if not old_uid:
+        return
+    ref = db.collection("integrations").document(old_uid)
+    snap = ref.get()
+    if not snap.exists:
+        return
+    accs = (snap.to_dict() or {}).get("instagram_accounts") or []
+    kept = [a for a in accs if str(a.get("id")) != str(ig_account_id)]
+    if len(kept) != len(accs):
+        ref.update({"instagram_accounts": kept, "updated_at": firestore.SERVER_TIMESTAMP})

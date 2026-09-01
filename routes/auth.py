@@ -33,6 +33,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from google.cloud import firestore
 
 from core import tenancy
+from core import pending_transfer
 from core.instagram_config import get_instagram_config
 from core.security import save_access_token, verify_firebase_token
 from core.state import generate_state, validate_state, InvalidStateError, STATE_LINK_TTL_SECONDS
@@ -321,19 +322,35 @@ async def instagram_process_callback(
         try:
             tenancy.claim_account_for_uid(db, user_uid, new_account_id)
         except tenancy.AccountAlreadyClaimed:
+            # §4.61 — NÃO é beco-sem-saída: a conta é de OUTRA agência. Guarda a conexão já
+            # autorizada (token + conta) numa pendência e devolve transfer_token + os nomes, pra o
+            # cliente decidir "manter ou transferir". Nada de posse muda até ele confirmar.
+            owner = tenancy.account_owner_info(db, new_account_id) or {}
+            old_agency_id = owner.get("agency_id")
+            transfer_token = pending_transfer.create(db, {
+                "ig_account_id": new_account_id, "ig_username": new_account_username,
+                "new_uid": user_uid, "invite_code": invite_code or "",
+                "long_token": long_token, "expires_in": expires_in,
+                "old_agency_id": old_agency_id, "old_connected_by_uid": owner.get("connected_by_uid"),
+                "profile_name": profile.get("name") or new_account_username or "",
+                "account_type": profile.get("account_type", "BUSINESS"),
+                "followers_count": profile.get("followers_count", 0),
+                "media_count": profile.get("media_count", 0),
+                "profile_picture_url": profile.get("profile_picture_url") or "",
+            })
             logger.warning(
-                "conexão recusada (conta já é de outra agência) user_uid=%s ig_id=%s",
-                user_uid, new_account_id,
+                "conta já é de outra agência — oferecendo transferência user_uid=%s ig_id=%s de=%s",
+                user_uid, new_account_id, old_agency_id,
             )
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "account_already_claimed",
-                    "message": (
-                        "Essa conta do Instagram já está conectada a outra conta Proof. Se ela é "
-                        "sua, desconecte na outra conta primeiro; se acha que é engano, fale com o "
-                        "suporte."
-                    ),
+                    "transfer_token": transfer_token,
+                    "old_agency_name": tenancy.agency_name(db, old_agency_id),
+                    "new_agency_name": tenancy.agency_name(db, tenancy.get_or_create_agency(db, user_uid)),
+                    "ig_username": new_account_username,
+                    "message": "Essa conta do Instagram já está com outra agência. Escolha manter ou transferir.",
                 },
             )
         except tenancy.PlanLimitReached as e:
@@ -702,3 +719,130 @@ def _dt_module():
     """Import lazy de datetime — evita warning de Pyright sobre uso top-level."""
     import datetime as _dt
     return _dt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §4.61 — TRANSFERÊNCIA de conta entre agências (o cliente é o dono; pode mudar de agência).
+# Fluxo: connect detecta conflito → pendência + 409 com transfer_token → o cliente vê a tela
+# "manter ou transferir" → confirm efetiva (fresh start: a agência nova re-analisa do zero) e a
+# antiga é avisada (email) + a conta some do painel dela. Ver map-account-ownership-transfer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# URL do pipeline (legado) pra notificar a agência antiga por email (DWD vive lá).
+LEGACY_INTERNAL_URL = os.getenv(
+    "LEGACY_INTERNAL_URL",
+    "https://instagram-media-extraction-200656387414.us-central1.run.app",
+).rstrip("/")
+
+
+def _upsert_integration_account(db, user_uid: str, account_doc: dict, api_key: str, expires_in) -> None:
+    """Grava/atualiza a conta IG no doc integrations/{user_uid} (merge por id) — mesmo formato do
+    callback normal, reusado no confirm da transferência."""
+    ref = db.collection("integrations").document(user_uid)
+    snap = ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        existing = data.get("instagram_accounts") or []
+        merged = [a for a in existing if str(a.get("id")) != str(account_doc["id"])]
+        merged.append(account_doc)
+        ref.update({"instagram_accounts": merged, "api_key": api_key, "status": "active",
+                    "updated_at": firestore.SERVER_TIMESTAMP, "token_expires_in_seconds": expires_in})
+    else:
+        ref.set({"user_uid": user_uid, "platform": "instagram", "auth_provider": "instagram_login_api",
+                 "api_key": api_key, "status": "active", "created_at": firestore.SERVER_TIMESTAMP,
+                 "instagram_accounts": [account_doc], "token_expires_in_seconds": expires_in})
+
+
+def _agency_owner_email(db, agency_id: str | None) -> str:
+    """Email do dono da agência (pra notificar a antiga). '' se não achar."""
+    if not agency_id:
+        return ""
+    ag = db.collection("pp_agencies").document(agency_id).get()
+    owner = (ag.to_dict() or {}).get("owner_uid") if ag.exists else None
+    if not owner:
+        return ""
+    u = db.collection("users").document(owner).get()
+    return ((u.to_dict() or {}).get("email") or "") if u.exists else ""
+
+
+async def _notify_account_moved(old_agency_id: str, handle: str, new_agency_name: str) -> None:
+    """Avisa a agência ANTIGA (email, best-effort) que a conta foi transferida. NUNCA falha o fluxo."""
+    try:
+        db = firestore.Client()
+        to_email = _agency_owner_email(db, old_agency_id)
+        if not to_email or not INTERNAL_SERVICE_TOKEN:
+            logger.info("notify account moved pulado (email=%s token=%s)", bool(to_email), bool(INTERNAL_SERVICE_TOKEN))
+            return
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{LEGACY_INTERNAL_URL}/internal/send-account-moved",
+                json={"to_email": to_email, "account_handle": handle, "new_agency_name": new_agency_name},
+                headers={"X-Internal-Token": INTERNAL_SERVICE_TOKEN},
+            )
+            if resp.status_code != 200:
+                logger.error("send-account-moved → %s: %s", resp.status_code, resp.text[:200])
+    except Exception:
+        logger.exception("falha ao notificar agência antiga (best-effort)")
+
+
+@router.get("/transfer/{token}")
+async def transfer_info(token: str):
+    """Info pra a tela de confirmação: de qual agência a conta é hoje e pra qual vai."""
+    db = firestore.Client()
+    p = pending_transfer.get(db, token)
+    if not p:
+        raise HTTPException(status_code=404, detail={"code": "transfer_expired",
+            "message": "Este pedido de transferência expirou. Conecte a conta de novo."})
+    return {
+        "ig_username": p.get("ig_username") or "",
+        "old_agency_name": tenancy.agency_name(db, p.get("old_agency_id")),
+        "new_agency_name": tenancy.agency_name(db, tenancy.get_or_create_agency(db, p["new_uid"])),
+    }
+
+
+@router.post("/transfer/{token}/confirm")
+async def transfer_confirm(token: str):
+    """Efetiva a transferência: move a posse pra agência nova, salva token/conta, tira da antiga,
+    dispara o pipeline (fresh start) e notifica a antiga por email."""
+    db = firestore.Client()
+    p = pending_transfer.get(db, token)
+    if not p:
+        raise HTTPException(status_code=404, detail={"code": "transfer_expired",
+            "message": "Este pedido de transferência expirou. Conecte a conta de novo."})
+    ig = str(p["ig_account_id"])
+    new_uid = p["new_uid"]
+    try:
+        old = tenancy.transfer_account(db, new_uid, ig)
+    except tenancy.PlanLimitReached:
+        raise HTTPException(status_code=402, detail={"code": "plan_limit",
+            "message": "Você atingiu o limite de contas do seu plano."})
+    api_key = str(uuid.uuid4())
+    await save_access_token(api_key, p["long_token"])
+    account_doc = {
+        "id": ig, "username": p.get("ig_username", ""), "name": p.get("profile_name", ""),
+        "account_type": p.get("account_type", "BUSINESS"), "followers_count": p.get("followers_count", 0),
+        "media_count": p.get("media_count", 0), "profile_picture_url": p.get("profile_picture_url", ""),
+        "active": True, "api_key": api_key, "token_expires_in_seconds": p.get("expires_in"),
+    }
+    _upsert_integration_account(db, new_uid, account_doc, api_key, p.get("expires_in"))
+    if old and old.get("old_connected_by_uid"):
+        tenancy.remove_account_from_integration(db, old["old_connected_by_uid"], ig)
+    code = p.get("invite_code")
+    if code:
+        _mark_invite_connected(code, ig, p.get("ig_username"))
+        await _trigger_agency_pipeline(new_uid, ig, code)
+    if old and old.get("old_agency_id"):
+        await _notify_account_moved(old["old_agency_id"], p.get("ig_username") or ig,
+                                    tenancy.agency_name(db, tenancy.get_or_create_agency(db, new_uid)))
+    pending_transfer.delete(db, token)
+    logger.info("conta transferida ig=%s -> uid=%s (de agência=%s)", ig, new_uid,
+                (old or {}).get("old_agency_id"))
+    return {"status": "transferida", "ig_account_id": ig, "username": p.get("ig_username")}
+
+
+@router.post("/transfer/{token}/cancel")
+async def transfer_cancel(token: str):
+    """Cliente escolheu MANTER com a agência atual — descarta a pendência (nada muda)."""
+    db = firestore.Client()
+    pending_transfer.delete(db, token)
+    return {"status": "mantida"}
