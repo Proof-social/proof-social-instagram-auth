@@ -30,8 +30,11 @@ class _DocRef:
         self.coll, self.key = coll, key
     def get(self):
         return _Snap(self.key, self.coll.store.get(self.key))
-    def set(self, data):
-        self.coll.store[self.key] = dict(data)
+    def set(self, data, merge=False):
+        if merge and self.key in self.coll.store:
+            self.coll.store[self.key].update(dict(data))
+        else:
+            self.coll.store[self.key] = dict(data)
     def create(self, data):
         if self.key in self.coll.store:
             raise gexc.AlreadyExists(self.key)

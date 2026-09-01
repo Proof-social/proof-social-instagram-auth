@@ -113,7 +113,10 @@ def claim_account_for_uid(db: firestore.Client, uid: str, ig_account_id: str) ->
     owner = _account_owner(db, acc)
     if owner is not None:
         if owner == agency_id:
-            return agency_id  # já é dessa agência — reconexão/refresh
+            # já é dessa agência — reconexão/refresh. RE-HABILITA se estava desabilitada (§4.62):
+            # a reconexão é justamente como o cliente traz de volta uma conta que a agência desligou.
+            db.collection(COLLECTION_ACCOUNT_REGISTRY).document(acc).set({"active": True}, merge=True)
+            return agency_id
         raise AccountAlreadyClaimed(acc)
 
     ag = db.collection(COLLECTION_AGENCIES).document(agency_id).get()
@@ -126,6 +129,7 @@ def claim_account_for_uid(db: firestore.Client, uid: str, ig_account_id: str) ->
         reg_ref.create({
             "instagram_account_id": acc, "agency_id": agency_id,
             "connected_by_uid": uid, "connected_at": firestore.SERVER_TIMESTAMP,
+            "active": True,   # §4.62 — conta nasce habilitada; a agência pode desligar depois
         })
     except gexc.AlreadyExists:
         # corrida: alguém registrou entre o get e o create
@@ -174,7 +178,7 @@ def transfer_account(db: firestore.Client, uid: str, ig_account_id: str) -> dict
         raise PlanLimitReached(str(limit))
     reg_ref.set({
         "instagram_account_id": acc, "agency_id": new_agency, "connected_by_uid": uid,
-        "connected_at": firestore.SERVER_TIMESTAMP,
+        "connected_at": firestore.SERVER_TIMESTAMP, "active": True,   # §4.62 — nasce habilitada
         "transferred_from": old_agency_id, "transferred_at": firestore.SERVER_TIMESTAMP,
     })
     return {"old_agency_id": old_agency_id, "old_connected_by_uid": old_uid} if old_agency_id else None
